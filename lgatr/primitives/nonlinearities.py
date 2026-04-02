@@ -23,9 +23,7 @@ def gated_relu(x: torch.Tensor, gates: torch.Tensor) -> torch.Tensor:
         Result has shape (..., 16)
     """
 
-    weights = torch.nn.functional.relu(gates)
-    outputs = weights * x
-    return outputs
+    return torch.nn.functional.relu(gates) * x
 
 
 def gated_sigmoid(x: torch.Tensor, gates: torch.Tensor):
@@ -48,9 +46,7 @@ def gated_sigmoid(x: torch.Tensor, gates: torch.Tensor):
         Result has shape (..., 16)
     """
 
-    weights = torch.nn.functional.sigmoid(gates)
-    outputs = weights * x
-    return outputs
+    return torch.sigmoid(gates) * x
 
 
 def gated_gelu(x: torch.Tensor, gates: torch.Tensor) -> torch.Tensor:
@@ -77,9 +73,7 @@ def gated_gelu(x: torch.Tensor, gates: torch.Tensor) -> torch.Tensor:
         Result has shape (..., 16)
     """
 
-    weights = torch.nn.functional.gelu(gates, approximate="tanh")
-    outputs = weights * x
-    return outputs
+    return torch.nn.functional.gelu(gates, approximate="tanh") * x
 
 
 def gated_silu(x: torch.Tensor, gates: torch.Tensor) -> torch.Tensor:
@@ -107,6 +101,4 @@ def gated_silu(x: torch.Tensor, gates: torch.Tensor) -> torch.Tensor:
         Result has shape (..., 16)
     """
 
-    weights = torch.nn.functional.silu(gates)
-    outputs = weights * x
-    return outputs
+    return torch.nn.functional.silu(gates) * x

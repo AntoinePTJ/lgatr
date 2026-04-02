@@ -10,6 +10,7 @@ from ..layers.attention.config import SelfAttentionConfig
 from ..layers.lgatr_block import LGATrBlock
 from ..layers.linear import EquiLinear
 from ..layers.mlp.config import MLPConfig
+from ..utils import compile_scope, maybe_compile_callable, maybe_compile_module
 
 
 class LGATr(nn.Module):
@@ -105,6 +106,15 @@ class LGATr(nn.Module):
         self._reinsert_s_channels = reinsert_s_channels
         self._reinsert_mv_channels = reinsert_mv_channels
         self._checkpoint_blocks = checkpoint_blocks
+        self._compiled_forward = None
+
+        # Optional graph compilation for kernel fusion / launch reduction.
+        if not self._checkpoint_blocks and compile_scope() == "full":
+            self._compiled_forward = maybe_compile_callable(self._forward_impl)
+        else:
+            self.linear_in = maybe_compile_module(self.linear_in)
+            self.blocks = nn.ModuleList([maybe_compile_module(block) for block in self.blocks])
+            self.linear_out = maybe_compile_module(self.linear_out)
 
     def forward(
         self,
@@ -130,7 +140,17 @@ class LGATr(nn.Module):
         outputs_s : None or torch.Tensor
             Output scalars with shape (..., items, out_s_channels). None if out_s_channels=None.
         """
+        if self._compiled_forward is not None:
+            return self._compiled_forward(multivectors, scalars, attn_kwargs)
+        return self._forward_impl(multivectors, scalars, attn_kwargs)
 
+    def _forward_impl(
+        self,
+        multivectors: torch.Tensor,
+        scalars: torch.Tensor | None,
+        attn_kwargs: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Shared forward implementation with explicit attention kwargs mapping."""
         # Channels that will be re-inserted in any query / key computation
         (
             additional_qk_features_mv,

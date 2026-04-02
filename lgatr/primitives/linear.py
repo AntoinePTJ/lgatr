@@ -5,7 +5,6 @@ from pathlib import Path
 
 import torch
 
-from ..utils.einsum import cached_einsum, custom_einsum
 from .config import gatr_config
 
 DEFAULT_DEVICE = torch.device("cpu")
@@ -128,7 +127,16 @@ def equi_linear(x: torch.Tensor, coeffs: torch.Tensor) -> torch.Tensor:
     basis = _compute_pin_equi_linear_basis(
         gatr_config.use_fully_connected_subgroup, device=x.device, dtype=x.dtype
     )
-    return custom_einsum("y x a, a i j, ... x j -> ... y i", coeffs, basis, x, path=[0, 1, 0, 1])
+
+    in_channels = x.shape[-2]
+    out_channels = coeffs.shape[0]
+
+    # Contract basis and coefficients once, then apply as a single GEMM.
+    kernel = torch.tensordot(coeffs, basis, dims=([-1], [0]))  # (y, x, i, j)
+    kernel = kernel.permute(0, 2, 1, 3).reshape(out_channels * 16, in_channels * 16)
+    x_flat = x.reshape(-1, in_channels * 16)
+    outputs = x_flat @ kernel.t()
+    return outputs.reshape(*x.shape[:-2], out_channels, 16)
 
 
 def grade_project(x: torch.Tensor) -> torch.Tensor:
@@ -155,13 +163,11 @@ def grade_project(x: torch.Tensor) -> torch.Tensor:
         dtype=x.dtype,
     )
 
-    # First five basis elements are grade projections
+    # First five basis elements are grade projections.
     basis = basis[:5]
-
-    # Project to grades
-    projections = cached_einsum("g i j, ... j -> ... g i", basis, x)
-
-    return projections
+    projection = basis.permute(2, 0, 1).reshape(16, 5 * 16)
+    outputs = x.reshape(-1, 16) @ projection
+    return outputs.reshape(*x.shape[:-1], 5, 16)
 
 
 def reverse(x: torch.Tensor) -> torch.Tensor:

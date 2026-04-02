@@ -11,6 +11,7 @@ from ..layers import (
     SelfAttentionConfig,
 )
 from ..layers.mlp.config import MLPConfig
+from ..utils import compile_scope, maybe_compile_callable, maybe_compile_module
 
 
 class ConditionalLGATr(nn.Module):
@@ -105,6 +106,15 @@ class ConditionalLGATr(nn.Module):
             out_s_channels=out_s_channels,
         )
         self._checkpoint_blocks = checkpoint_blocks
+        self._compiled_forward = None
+
+        # Optional graph compilation for kernel fusion / launch reduction.
+        if not self._checkpoint_blocks and compile_scope() == "full":
+            self._compiled_forward = maybe_compile_callable(self._forward_impl)
+        else:
+            self.linear_in = maybe_compile_module(self.linear_in)
+            self.blocks = nn.ModuleList([maybe_compile_module(block) for block in self.blocks])
+            self.linear_out = maybe_compile_module(self.linear_out)
 
     def forward(
         self,
@@ -141,7 +151,34 @@ class ConditionalLGATr(nn.Module):
         """
         attn_kwargs = attn_kwargs if attn_kwargs is not None else {}
         crossattn_kwargs = crossattn_kwargs if crossattn_kwargs is not None else {}
+        if self._compiled_forward is not None:
+            return self._compiled_forward(
+                multivectors,
+                multivectors_condition,
+                scalars,
+                scalars_condition,
+                attn_kwargs,
+                crossattn_kwargs,
+            )
+        return self._forward_impl(
+            multivectors,
+            multivectors_condition,
+            scalars,
+            scalars_condition,
+            attn_kwargs,
+            crossattn_kwargs,
+        )
 
+    def _forward_impl(
+        self,
+        multivectors: torch.Tensor,
+        multivectors_condition: torch.Tensor,
+        scalars: torch.Tensor | None,
+        scalars_condition: torch.Tensor | None,
+        attn_kwargs: dict,
+        crossattn_kwargs: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Shared forward implementation with explicit kwargs mappings."""
         # Decode condition into main track with
         h_mv, h_s = self.linear_in(multivectors, scalars=scalars)
         for block in self.blocks:

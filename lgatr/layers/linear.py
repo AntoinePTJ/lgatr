@@ -5,7 +5,6 @@ import math
 import torch
 from torch import nn
 
-from ..interface import embed_scalar
 from ..primitives.config import gatr_config
 from ..primitives.linear import equi_linear
 
@@ -129,6 +128,26 @@ class EquiLinear(nn.Module):
         # Initialization
         self.reset_parameters(initialization)
 
+    def forward_mv(
+        self, multivectors: torch.Tensor, scalars: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Maps input multivectors to output multivectors only."""
+
+        outputs_mv = equi_linear(multivectors, self.weight)  # (..., out_channels, 16)
+
+        if self.bias is not None:
+            outputs_mv.narrow(-1, 0, 1).add_(self.bias.squeeze(-1).unsqueeze(-1))
+
+        if self.s2mvs is not None and scalars is not None:
+            if gatr_config.use_fully_connected_subgroup:
+                s2mvs = self.s2mvs(scalars).view(*outputs_mv.shape[:-2], outputs_mv.shape[-2], 2)
+                outputs_mv.narrow(-1, 0, 1).add_(s2mvs[..., 0:1])
+                outputs_mv.narrow(-1, 15, 1).add_(s2mvs[..., 1:2])
+            else:
+                outputs_mv.narrow(-1, 0, 1).add_(self.s2mvs(scalars).unsqueeze(-1))
+
+        return outputs_mv
+
     def forward(
         self, multivectors: torch.Tensor, scalars: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -148,26 +167,17 @@ class EquiLinear(nn.Module):
         outputs_s : None or torch.Tensor
             Output scalars with shape (..., out_s_channels)
         """
-
-        outputs_mv = equi_linear(multivectors, self.weight)  # (..., out_channels, 16)
-
-        if self.bias is not None:
-            bias = embed_scalar(self.bias)
-            outputs_mv = outputs_mv + bias
-
-        if self.s2mvs is not None and scalars is not None:
-            if gatr_config.use_fully_connected_subgroup:
-                outputs_mv[..., [0, -1]] += self.s2mvs(scalars).view(
-                    *outputs_mv.shape[:-2], outputs_mv.shape[-2], 2
-                )
-            else:
-                outputs_mv[..., 0] += self.s2mvs(scalars)
+        outputs_mv = self.forward_mv(multivectors, scalars)
 
         if self.mvs2s is not None:
             if gatr_config.use_fully_connected_subgroup:
-                outputs_s = self.mvs2s(multivectors[..., [0, -1]].flatten(start_dim=-2))
+                scalar_ps = torch.cat(
+                    (multivectors.narrow(-1, 0, 1), multivectors.narrow(-1, 15, 1)),
+                    dim=-1,
+                )
+                outputs_s = self.mvs2s(scalar_ps.flatten(start_dim=-2))
             else:
-                outputs_s = self.mvs2s(multivectors[..., 0])
+                outputs_s = self.mvs2s(multivectors.narrow(-1, 0, 1).squeeze(-1))
             if self.s2s is not None and scalars is not None:
                 outputs_s = outputs_s + self.s2s(scalars)
         else:

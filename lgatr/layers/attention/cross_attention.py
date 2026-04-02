@@ -1,7 +1,6 @@
 """L-GATr cross-attention."""
 
 import torch
-from einops import rearrange
 from torch import nn
 
 from ..dropout import GradeDropout
@@ -134,56 +133,44 @@ class CrossAttention(nn.Module):
             multivectors_kv, scalars_kv
         )  # (..., num_items, 2*hidden_channels, 16)
         k_mv, v_mv = torch.tensor_split(kv_mv, 2, dim=-2)
-        k_s, v_s = torch.tensor_split(kv_s, 2, dim=-1)
+        k_s, v_s = (torch.tensor_split(kv_s, 2, dim=-1) if kv_s is not None else (None, None))
 
         # Rearrange to (..., heads, items, channels, 16) shape
-        q_mv = rearrange(
-            q_mv,
-            "... items (hidden_channels num_heads) x -> ... num_heads items hidden_channels x",
-            num_heads=self.config.num_heads,
-            hidden_channels=self.config.hidden_mv_channels,
-        )
+        *batch, q_items, _, blade = q_mv.shape
+        q_mv = q_mv.reshape(
+            *batch, q_items, self.config.num_heads, self.config.hidden_mv_channels, blade
+        ).permute(*range(len(batch)), -3, -4, -2, -1)
         if self.config.multi_query:
-            k_mv = rearrange(k_mv, "... items hidden_channels x -> ... 1 items hidden_channels x")
-            v_mv = rearrange(v_mv, "... items hidden_channels x -> ... 1 items hidden_channels x")
+            k_mv = k_mv.unsqueeze(-4)
+            v_mv = v_mv.unsqueeze(-4)
         else:
-            k_mv = rearrange(
-                k_mv,
-                "... items (hidden_channels num_heads) x -> ... num_heads items hidden_channels x",
-                num_heads=self.config.num_heads,
-                hidden_channels=self.config.hidden_mv_channels,
-            )
-            v_mv = rearrange(
-                v_mv,
-                "... items (hidden_channels num_heads) x -> ... num_heads items hidden_channels x",
-                num_heads=self.config.num_heads,
-                hidden_channels=self.config.hidden_mv_channels,
-            )
+            *k_batch, k_items, _, _ = k_mv.shape
+            k_mv = k_mv.reshape(
+                *k_batch, k_items, self.config.num_heads, self.config.hidden_mv_channels, blade
+            ).permute(*range(len(k_batch)), -3, -4, -2, -1)
+            *v_batch, v_items, _, _ = v_mv.shape
+            v_mv = v_mv.reshape(
+                *v_batch, v_items, self.config.num_heads, self.config.hidden_mv_channels, blade
+            ).permute(*range(len(v_batch)), -3, -4, -2, -1)
 
         # Same for scalars
         if q_s is not None:
-            q_s = rearrange(
-                q_s,
-                "... items (hidden_channels num_heads) -> ... num_heads items hidden_channels",
-                num_heads=self.config.num_heads,
-                hidden_channels=self.config.hidden_s_channels,
-            )
+            *q_batch_s, q_items_s, _ = q_s.shape
+            q_s = q_s.reshape(
+                *q_batch_s, q_items_s, self.config.num_heads, self.config.hidden_s_channels
+            ).permute(*range(len(q_batch_s)), -2, -3, -1)
             if self.config.multi_query:
-                k_s = rearrange(k_s, "... items hidden_channels -> ... 1 items hidden_channels")
-                v_s = rearrange(v_s, "... items hidden_channels -> ... 1 items hidden_channels")
+                k_s = k_s.unsqueeze(-3)
+                v_s = v_s.unsqueeze(-3)
             else:
-                k_s = rearrange(
-                    k_s,
-                    "... items (hidden_channels num_heads) -> ... num_heads items hidden_channels",
-                    num_heads=self.config.num_heads,
-                    hidden_channels=self.config.hidden_s_channels,
-                )
-                v_s = rearrange(
-                    v_s,
-                    "... items (hidden_channels num_heads) -> ... num_heads items hidden_channels",
-                    num_heads=self.config.num_heads,
-                    hidden_channels=self.config.hidden_s_channels,
-                )
+                *k_batch_s, k_items_s, _ = k_s.shape
+                k_s = k_s.reshape(
+                    *k_batch_s, k_items_s, self.config.num_heads, self.config.hidden_s_channels
+                ).permute(*range(len(k_batch_s)), -2, -3, -1)
+                *v_batch_s, v_items_s, _ = v_s.shape
+                v_s = v_s.reshape(
+                    *v_batch_s, v_items_s, self.config.num_heads, self.config.hidden_s_channels
+                ).permute(*range(len(v_batch_s)), -2, -3, -1)
         else:
             q_s, k_s, v_s = None, None, None
 
@@ -203,14 +190,15 @@ class CrossAttention(nn.Module):
             )
             h_s = h_s * self.head_scale.view(*[1] * len(h_s.shape[:-4]), len(self.head_scale), 1, 1)
 
-        h_mv = rearrange(
-            h_mv,
-            "... n_heads n_items hidden_channels x -> ... n_items (n_heads hidden_channels) x",
+        *h_batch, h_heads, h_items, h_hidden, h_blade = h_mv.shape
+        h_mv = h_mv.permute(*range(len(h_batch)), -3, -4, -2, -1).reshape(
+            *h_batch, h_items, h_heads * h_hidden, h_blade
         )
-        h_s = rearrange(
-            h_s,
-            "... n_heads n_items hidden_channels -> ... n_items (n_heads hidden_channels)",
-        )
+        if h_s is not None:
+            *hs_batch, hs_heads, hs_items, hs_hidden = h_s.shape
+            h_s = h_s.permute(*range(len(hs_batch)), -2, -3, -1).reshape(
+                *hs_batch, hs_items, hs_heads * hs_hidden
+            )
 
         # Transform linearly one more time
         outputs_mv, outputs_s = self.out_linear(h_mv, scalars=h_s)

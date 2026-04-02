@@ -1,7 +1,6 @@
 """L-GATr self-attention."""
 
 import torch
-from einops import rearrange
 from torch import nn
 
 from ..dropout import GradeDropout
@@ -126,14 +125,15 @@ class SelfAttention(nn.Module):
             )
             h_s = h_s * self.head_scale.view(*[1] * len(h_s.shape[:-4]), len(self.head_scale), 1, 1)
 
-        h_mv = rearrange(
-            h_mv,
-            "... n_heads n_items hidden_channels x -> ... n_items (n_heads hidden_channels) x",
+        *batch, n_heads, n_items, hidden_channels, blade = h_mv.shape
+        h_mv = h_mv.permute(*range(len(batch)), -3, -4, -2, -1).reshape(
+            *batch, n_items, n_heads * hidden_channels, blade
         )
-        h_s = rearrange(
-            h_s,
-            "... n_heads n_items hidden_channels -> ... n_items (n_heads hidden_channels)",
-        )
+        if h_s is not None:
+            *batch_s, n_heads_s, n_items_s, hidden_channels_s = h_s.shape
+            h_s = h_s.permute(*range(len(batch_s)), -2, -3, -1).reshape(
+                *batch_s, n_items_s, n_heads_s * hidden_channels_s
+            )
 
         # Transform linearly one more time
         outputs_mv, outputs_s = self.out_linear(h_mv, scalars=h_s)

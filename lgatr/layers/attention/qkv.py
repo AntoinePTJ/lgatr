@@ -1,5 +1,4 @@
 import torch
-from einops import rearrange
 from torch import nn
 
 from ..layer_norm import EquiLayerNorm
@@ -31,6 +30,28 @@ class QKVModule(nn.Module):
         )
         self.norm_qkv = EquiLayerNorm()
         self.config = config
+
+    def _reshape_qkv_mv(self, qkv_mv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reshapes MV QKV projection to (qkv, ..., heads, items, hidden, 16)."""
+
+        *batch, items, _, blade = qkv_mv.shape
+        num_heads = self.config.num_heads
+        hidden = self.config.hidden_mv_channels
+        qkv_mv = qkv_mv.reshape(*batch, items, 3, hidden, num_heads, blade)
+        qkv_mv = qkv_mv.permute(-4, *range(len(batch)), -2, -5, -3, -1)
+        return qkv_mv.unbind(0)
+
+    def _reshape_qkv_s(
+        self, qkv_s: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reshapes scalar QKV projection to (qkv, ..., heads, items, hidden)."""
+
+        *batch, items, _ = qkv_s.shape
+        num_heads = self.config.num_heads
+        hidden = self.config.hidden_s_channels
+        qkv_s = qkv_s.reshape(*batch, items, 3, hidden, num_heads)
+        qkv_s = qkv_s.permute(-3, *range(len(batch)), -1, -4, -2)
+        return qkv_s.unbind(0)
 
     def forward(
         self,
@@ -76,28 +97,12 @@ class QKVModule(nn.Module):
         if additional_qk_features_s is not None:
             scalars = torch.cat((scalars, additional_qk_features_s), dim=-1)
 
-        qkv_mv, qkv_s = self.in_linear(
-            inputs, scalars
-        )  # (..., num_items, 3 * hidden_channels * num_heads, 16)
-        qkv_mv = rearrange(
-            qkv_mv,
-            "... items (qkv hidden num_heads) x -> qkv ... num_heads items hidden x",
-            num_heads=self.config.num_heads,
-            hidden=self.config.hidden_mv_channels,
-            qkv=3,
-        )
-        q_mv, k_mv, v_mv = qkv_mv  # each: (..., num_heads, num_items, num_channels, 16)
+        qkv_mv, qkv_s = self.in_linear(inputs, scalars)
+        q_mv, k_mv, v_mv = self._reshape_qkv_mv(qkv_mv)
 
         # Same, for optional scalar components
         if qkv_s is not None:
-            qkv_s = rearrange(
-                qkv_s,
-                "... items (qkv hidden num_heads) -> qkv ... num_heads items hidden",
-                num_heads=self.config.num_heads,
-                hidden=self.config.hidden_s_channels,
-                qkv=3,
-            )
-            q_s, k_s, v_s = qkv_s  # each: (..., num_heads, num_items, num_channels)
+            q_s, k_s, v_s = self._reshape_qkv_s(qkv_s)
         else:
             q_s, k_s, v_s = None, None, None
 
@@ -146,6 +151,24 @@ class MultiQueryQKVModule(nn.Module):
         )
         self.norm_qkv = EquiLayerNorm()
         self.config = config
+
+    def _reshape_query_mv(self, q_mv: torch.Tensor) -> torch.Tensor:
+        """Reshapes MV query projection to (..., heads, items, hidden, 16)."""
+
+        *batch, items, _, blade = q_mv.shape
+        num_heads = self.config.num_heads
+        hidden = self.config.hidden_mv_channels
+        return q_mv.reshape(*batch, items, num_heads, hidden, blade).permute(
+            *range(len(batch)), -3, -4, -2, -1
+        )
+
+    def _reshape_query_s(self, q_s: torch.Tensor) -> torch.Tensor:
+        """Reshapes scalar query projection to (..., heads, items, hidden)."""
+
+        *batch, items, _ = q_s.shape
+        num_heads = self.config.num_heads
+        hidden = self.config.hidden_s_channels
+        return q_s.reshape(*batch, items, num_heads, hidden).permute(*range(len(batch)), -2, -3, -1)
 
     def forward(
         self,
@@ -207,25 +230,15 @@ class MultiQueryQKVModule(nn.Module):
         v_mv, v_s = self.v_linear(inputs, scalars)  # (..., num_items, hidden_channels, 16)
 
         # Rearrange to (..., heads, items, channels, 16) shape
-        q_mv = rearrange(
-            q_mv,
-            "... items (hidden_channels num_heads) x -> ... num_heads items hidden_channels x",
-            num_heads=self.config.num_heads,
-            hidden_channels=self.config.hidden_mv_channels,
-        )
-        k_mv = rearrange(k_mv, "... items hidden_channels x -> ... 1 items hidden_channels x")
-        v_mv = rearrange(v_mv, "... items hidden_channels x -> ... 1 items hidden_channels x")
+        q_mv = self._reshape_query_mv(q_mv)
+        k_mv = k_mv.unsqueeze(-4)
+        v_mv = v_mv.unsqueeze(-4)
 
         # Same for scalars
         if q_s is not None:
-            q_s = rearrange(
-                q_s,
-                "... items (hidden_channels num_heads) -> ... num_heads items hidden_channels",
-                num_heads=self.config.num_heads,
-                hidden_channels=self.config.hidden_s_channels,
-            )
-            k_s = rearrange(k_s, "... items hidden_channels -> ... 1 items hidden_channels")
-            v_s = rearrange(v_s, "... items hidden_channels -> ... 1 items hidden_channels")
+            q_s = self._reshape_query_s(q_s)
+            k_s = k_s.unsqueeze(-3)
+            v_s = v_s.unsqueeze(-3)
         else:
             q_s, k_s, v_s = None, None, None
 

@@ -23,16 +23,14 @@ def grade_dropout(x: torch.Tensor, p: float, training: bool = True) -> torch.Ten
         Inputs with dropout applied, shape (..., 16).
     """
 
-    # Project to grades
-    x = grade_project(x)
+    if not training or p == 0.0:
+        return x
+    if p >= 1.0:
+        return torch.zeros_like(x)
 
-    # Apply standard 1D dropout
-    # For whatever reason, that only works with a single batch dimension, so let's reshape a bit
-    h = x.view(-1, 5, 16)
-    h = torch.nn.functional.dropout1d(h, p=p, training=training, inplace=False)
-    h = h.view(x.shape)
-
-    # Combine grades again
-    h = torch.sum(h, dim=-2)
-
-    return h
+    grades = grade_project(x)
+    keep_prob = 1.0 - p
+    mask_shape = (*grades.shape[:-2], 5, 1)
+    mask = (torch.rand(mask_shape, device=x.device) < keep_prob).to(dtype=x.dtype)
+    grades = grades * (mask / keep_prob)
+    return torch.sum(grades, dim=-2)

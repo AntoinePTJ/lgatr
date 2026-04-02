@@ -63,6 +63,9 @@ class GeometricBilinear(nn.Module):
             hidden_mv_channels, out_mv_channels, in_s_channels, out_s_channels
         )
         self.norm = EquiLayerNorm()
+        bivector_mask = torch.ones(16, dtype=torch.float32)
+        bivector_mask[5:11] = 0.0
+        self.register_buffer("_bivector_mask", bivector_mask)
 
     def forward(
         self,
@@ -87,11 +90,11 @@ class GeometricBilinear(nn.Module):
         """
 
         # GP
-        left, _ = self.linear_left(multivectors, scalars=scalars)
-        right, _ = self.linear_right(multivectors, scalars=scalars)
+        left = self.linear_left.forward_mv(multivectors, scalars=scalars)
+        right = self.linear_right.forward_mv(multivectors, scalars=scalars)
         gp_outputs = geometric_product(left, right)
         if not gatr_config.use_bivector:
-            gp_outputs[..., 5:11] = 0.0
+            gp_outputs = gp_outputs * self._bivector_mask
 
         # Output linear
         outputs_mv, outputs_s = self.linear_out(gp_outputs, scalars=scalars)

@@ -17,6 +17,7 @@ dependencies = [
     "numpy",
     "einops",
     "opt_einsum",
+    "setuptools>=82.0.0",
 ]
 
 [project.optional-dependencies]

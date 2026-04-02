@@ -20,26 +20,30 @@ class GradeDropout(nn.Module):
         self._dropout_prob = p
 
     def forward(
-        self, multivectors: torch.Tensor, scalars: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self, multivectors: torch.Tensor, scalars: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward pass. Applies dropout.
 
         Parameters
         ----------
         multivectors : torch.Tensor
             Multivector inputs  with shape (..., 16).
-        scalars : torch.Tensor
-            Scalar inputs with shape (...).
+        scalars : None or torch.Tensor
+            Optional scalar inputs with shape (...).
 
         Returns
         -------
         outputs_mv : torch.Tensor
             Multivector inputs with dropout applied, shape (..., 16).
-        output_scalars : torch.Tensor
+        output_scalars : None or torch.Tensor
             Scalar inputs with dropout applied, shape (...).
         """
 
         out_mv = grade_dropout(multivectors, p=self._dropout_prob, training=self.training)
-        out_s = torch.nn.functional.dropout(scalars, p=self._dropout_prob, training=self.training)
+        out_s = (
+            None
+            if scalars is None
+            else torch.nn.functional.dropout(scalars, p=self._dropout_prob, training=self.training)
+        )
 
         return out_mv, out_s
