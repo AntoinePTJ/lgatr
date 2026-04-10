@@ -8,6 +8,7 @@ to easily construct Lorentz-equivariant layers.
 These layers are combined into a transformer architecture.
 The L-GATr-slim variant further improves efficiency by using only
 scalar and vector representations.
+An additional slim variant supports parity-odd pseudoscalar channels.
 
 .. image:: /_static/gatr.png
    :align: center

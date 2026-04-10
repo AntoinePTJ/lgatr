@@ -10,6 +10,8 @@ For tasks where conditional inputs are required, you can process the condition w
 and then include this processed condition using a :class:`~lgatr.nets.conditional_lgatr.ConditionalLGATr`.
 In addition :class:`~lgatr.nets.slim.LGATrSlim` and :class:`~lgatr.nets.conditional_slim.ConditionalLGATrSlim`
 provide more efficient versions of the respective networks using only scalar and vector representations.
+For tasks that also require parity-odd scalar features, :class:`~lgatr.nets.lgatr_slim_pseudo.LGATrSlimPseudo`
+extends the slim architecture with an additional pseudoscalar stream and a dedicated vector-to-pseudoscalar map.
 
 .. autosummary::
    :toctree: generated/
@@ -19,6 +21,7 @@ provide more efficient versions of the respective networks using only scalar and
    lgatr.nets.conditional_lgatr.ConditionalLGATr
    lgatr.nets.slim.LGATrSlim
    lgatr.nets.conditional_slim.ConditionalLGATrSlim
+   lgatr.nets.slim_pseudo.LGATrSlimPseudo
 
 .. _l-gatr-layers:
 
@@ -116,6 +119,7 @@ L-GATr-slim Layers
 
 In addition to the full L-GATr network, we provide a slimmed-down version that uses only scalar and vector representations instead of full multivectors.
 This approach allows a more efficient implementation while achieving similar performance on all high-energy physics tasks we have tested so far.
+The pseudoscalar-extended slim variant keeps the same lightweight structure while adding explicit parity-odd channels.
 
 .. autosummary::
    :toctree: generated/
@@ -130,3 +134,10 @@ This approach allows a more efficient implementation while achieving similar per
    lgatr.layers.slim_layers.SlimLinear
    lgatr.layers.slim_layers.SlimRMSNorm
    lgatr.layers.slim_layers.SlimDropout
+   lgatr.layers.slim_pseudo_layers.SlimPseudoBlock
+   lgatr.layers.slim_pseudo_layers.SlimPseudoSelfAttention
+   lgatr.layers.slim_pseudo_layers.SlimPseudoMLP
+   lgatr.layers.slim_pseudo_layers.SlimPseudoGLU
+   lgatr.layers.slim_pseudo_layers.SlimPseudoLinear
+   lgatr.layers.slim_pseudo_layers.SlimPseudoRMSNorm
+   lgatr.layers.slim_pseudo_layers.VectorToPseudoscalar
