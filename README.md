@@ -50,6 +50,7 @@ Overview of features in L-GATr:
 - Interface to the geometric algebra: Embedding and extracting multivectors; spurions for symmetry breaking at the input level
 - Many hyperparameters to play with, organized via the `SelfAttentionConfig`, `CrossAttentionConfig`, `MLPConfig` and `PrimitivesConfig` objects
 - `LGATrSlim` and `ConditionalLGATrSlim` as more efficient variants that use only scalar and vector representations
+- `LGATrSlimPseudo` as a slim variant with an additional pseudoscalar stream and a dedicated vector-to-pseudoscalar map
 
 ## Examples
 

@@ -42,6 +42,27 @@ You can construct a simple :class:`~lgatr.nets.lgatr_slim.LGATrSlim` model as fo
       num_heads=1,
    )
 
+If your task requires an explicit parity-odd scalar channel, you can use
+:class:`~lgatr.nets.lgatr_slim_pseudo.LGATrSlimPseudo` instead:
+
+.. code-block:: python
+
+   from lgatr import LGATrSlimPseudo
+
+   lgatr = LGATrSlimPseudo(
+      in_v_channels=1,
+      out_v_channels=1,
+      hidden_v_channels=8,
+      in_s_channels=0,
+      out_s_channels=0,
+      hidden_s_channels=16,
+      in_p_channels=0,
+      out_p_channels=1,
+      hidden_p_channels=4,
+      num_blocks=2,
+      num_heads=1,
+   )
+
 
 Using L-GATr-slim
 -----------------
@@ -70,6 +91,21 @@ Now we can use the model:
    output_v, output_s = lgatr(vectors=vectors, scalars=scalars)
    print(output_v.shape) # torch.Size([128, 20, 1, 4])
    print(output_s.shape) # torch.Size([128, 20, 1, 1])
+
+For :class:`~lgatr.nets.lgatr_slim_pseudo.LGATrSlimPseudo`, provide an additional
+pseudoscalar tensor and read out a third output:
+
+.. code-block:: python
+
+   pseudoscalars = torch.zeros(128, 20, 0)
+   output_v, output_s, output_p = lgatr(
+      vectors=vectors,
+      scalars=scalars,
+      pseudoscalars=pseudoscalars,
+   )
+   print(output_v.shape) # torch.Size([128, 20, 1, 4])
+   print(output_s.shape) # torch.Size([128, 20, 1])
+   print(output_p.shape) # torch.Size([128, 20, 1])
 
 Next steps
 ----------

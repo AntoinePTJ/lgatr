@@ -10,6 +10,8 @@ For tasks where conditional inputs are required, you can process the condition w
 and then include this processed condition using a :class:`~lgatr.nets.conditional_lgatr.ConditionalLGATr`.
 In addition :class:`~lgatr.nets.lgatr_slim.LGATrSlim` and :class:`~lgatr.nets.conditional_lgatr_slim.ConditionalLGATrSlim`
 provide more efficient versions of the respective networks using only scalar and vector representations.
+For tasks that also require parity-odd scalar features, :class:`~lgatr.nets.lgatr_slim_pseudo.LGATrSlimPseudo`
+extends the slim architecture with an additional pseudoscalar stream and a dedicated vector-to-pseudoscalar map.
 
 .. autosummary::
    :toctree: generated/
@@ -19,6 +21,7 @@ provide more efficient versions of the respective networks using only scalar and
    lgatr.nets.conditional_lgatr.ConditionalLGATr
    lgatr.nets.lgatr_slim.LGATrSlim
    lgatr.nets.conditional_lgatr_slim.ConditionalLGATrSlim
+   lgatr.nets.lgatr_slim_pseudo.LGATrSlimPseudo
 
 L-GATr Layers
 -------------
@@ -113,6 +116,7 @@ L-GATr-slim Layers
 
 In addition to the full L-GATr network, we provide a slimmed-down version that uses only scalar and vector representations instead of full multivectors.
 This approach allows a more efficient implementation while achieving similar performance on all high-energy physics tasks we have tested so far.
+The pseudoscalar-extended slim variant keeps the same lightweight structure while adding explicit parity-odd channels.
 
 .. autosummary::
    :toctree: generated/
@@ -127,3 +131,11 @@ This approach allows a more efficient implementation while achieving similar per
    lgatr.nets.lgatr_slim.Linear
    lgatr.nets.lgatr_slim.RMSNorm
    lgatr.nets.lgatr_slim.Dropout
+   lgatr.nets.lgatr_slim_pseudo.VectorToPseudoscalar
+   lgatr.nets.lgatr_slim_pseudo.LGATrSlimPseudoBlock
+   lgatr.nets.lgatr_slim_pseudo.SelfAttention
+   lgatr.nets.lgatr_slim_pseudo.MLP
+   lgatr.nets.lgatr_slim_pseudo.GatedLinearUnit
+   lgatr.nets.lgatr_slim_pseudo.Linear
+   lgatr.nets.lgatr_slim_pseudo.RMSNorm
+   lgatr.nets.lgatr_slim_pseudo.Dropout
