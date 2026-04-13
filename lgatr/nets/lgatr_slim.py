@@ -8,6 +8,7 @@ from torch import nn
 from torch.nn.functional import dropout, dropout1d
 from torch.utils.checkpoint import checkpoint
 
+from .lgatr_slim_pseudo import LGATrSlimPseudo
 from ..primitives.attention import scaled_dot_product_attention
 from ..utils.autocast import minimum_autocast_precision, naive_amp
 from ..utils.compile import compile_model
@@ -696,6 +697,15 @@ class LGATrSlim(nn.Module):
         Number of Lorentz-transformer blocks.
     num_heads
         Number of attention heads.
+    in_p_channels
+        Number of input pseudoscalar channels. If nonzero, :class:`LGATrSlim` dispatches
+        internally to the pseudoscalar-enabled :class:`LGATrSlimPseudo` implementation.
+    out_p_channels
+        Number of output pseudoscalar channels. If nonzero, :class:`LGATrSlim` dispatches
+        internally to the pseudoscalar-enabled :class:`LGATrSlimPseudo` implementation.
+    hidden_p_channels
+        Number of hidden pseudoscalar channels. If nonzero, :class:`LGATrSlim` dispatches
+        internally to the pseudoscalar-enabled :class:`LGATrSlimPseudo` implementation.
     nonlinearity
         Nonlinearity for the MLP layers.
     nonlinearity_v
@@ -729,6 +739,31 @@ class LGATrSlim(nn.Module):
         smaller activation memory peak. ``None`` leaves torch's global setting untouched. Smaller values down to ``0.3`` can help to reduce training memory usage.
     """
 
+    def __new__(
+        cls,
+        *args,
+        in_p_channels: int = 0,
+        out_p_channels: int = 0,
+        hidden_p_channels: int = 0,
+        **kwargs,
+    ):
+
+
+        if cls is LGATrSlim and hidden_p_channels + out_p_channels != 0:
+            if len(args) > 6:
+                raise ValueError(
+                    "Positional arguments conflict with pseudoscalar channels." \
+                    "Only vector and scalar channels can be passed positionally."
+                )
+            return LGATrSlimPseudo(
+                *args,
+                in_p_channels=in_p_channels,
+                out_p_channels=out_p_channels,
+                hidden_p_channels=hidden_p_channels,
+                **kwargs,
+            )
+        return super().__new__(cls)
+
     def __init__(
         self,
         in_v_channels: int,
@@ -739,6 +774,9 @@ class LGATrSlim(nn.Module):
         hidden_s_channels: int,
         num_blocks: int,
         num_heads: int,
+        in_p_channels: int = 0,
+        out_p_channels: int = 0,
+        hidden_p_channels: int = 0,
         nonlinearity: str = "gelu",
         nonlinearity_v: str | None = "sigmoid",
         mlp_ratio: int = 2,

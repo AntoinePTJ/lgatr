@@ -708,7 +708,7 @@ class LGATrSlimPseudo(nn.Module):
             # note that we need fullgraph=False because of the torch.compiler.disable for attention
             self.__class__ = torch.compile(self.__class__, dynamic=True, mode="default")
 
-    def forward(self, vectors, scalars, pseudoscalars, **attn_kwargs):
+    def forward(self, vectors, scalars, pseudoscalars = None, **attn_kwargs):
         """
         Parameters
         ----------
@@ -716,7 +716,7 @@ class LGATrSlimPseudo(nn.Module):
             A tensor of shape (..., v_channels, 4) representing Lorentz vectors.
         scalars : torch.Tensor
             A tensor of shape (..., s_channels) representing scalar features.
-        pseudoscalars : torch.Tensor
+        pseudoscalars : torch.Tensor, optional
             A tensor of shape (..., p_channels) representing pseudoscalar features.
         **attn_kwargs : dict
             Additional keyword arguments for the attention function.
@@ -726,6 +726,12 @@ class LGATrSlimPseudo(nn.Module):
         torch.Tensor, torch.Tensor, torch.Tensor
             Tensors of the same shape as input representing the normalized vectors, scalars and pseudoscalars.
         """
+
+        if pseudoscalars is None and self.linear_in._in_p_channels == 0:
+            pseudoscalars = torch.empty(scalars.shape[:-1] + (0,), device=scalars.device, dtype=scalars.dtype)
+        else:
+            assert pseudoscalars is not None, "Pseudoscalar input cannot be None if the model expects pseudoscalar channels."
+
         h_v, h_s, h_p = self.linear_in(vectors, scalars, pseudoscalars)
 
         for block in self.blocks:

@@ -1,11 +1,11 @@
 import pytest
 import torch
 
+from lgatr.nets.lgatr_slim import LGATrSlim
 from lgatr.nets.lgatr_slim_pseudo import (
     MLP,
     Dropout,
     GatedLinearUnit,
-    LGATrSlimPseudo,
     LGATrSlimPseudoBlock,
     Linear,
     RMSNorm,
@@ -380,7 +380,7 @@ def test_LGATrSlimPseudo_equivariance(
     dropout_prob,
     checkpoint_blocks,
 ):
-    layer = LGATrSlimPseudo(
+    layer = LGATrSlim(
         in_v_channels=in_v_channels,
         out_v_channels=out_v_channels,
         hidden_v_channels=hidden_v_channels,
@@ -439,7 +439,7 @@ def test_LGATrSlimPseudo_equivariance_compiled(
     num_blocks,
     compile=True,
 ):
-    layer = LGATrSlimPseudo(
+    layer = LGATrSlim(
         in_v_channels=in_v_channels,
         out_v_channels=out_v_channels,
         hidden_v_channels=hidden_v_channels,

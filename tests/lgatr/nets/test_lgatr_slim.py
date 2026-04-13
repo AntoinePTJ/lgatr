@@ -11,6 +11,7 @@ from lgatr.nets.lgatr_slim import (
     RMSNorm,
     SelfAttention,
 )
+from lgatr.nets.lgatr_slim_pseudo import LGATrSlimPseudo
 
 from ...helpers.constants import BATCH_DIMS, TOLERANCES
 from ...helpers.equivariance_noga import check_equivariance
@@ -374,3 +375,31 @@ def test_LGATrSlim_equivariance_compiled(
     # equivariance
     batch_dims = batch_dims + [in_v_channels]
     check_equivariance(layer, batch_dims=batch_dims, fn_kwargs=dict(scalars=s), **TOLERANCES)
+
+
+def test_LGATrSlim_dispatches_to_pseudo():
+    layer = LGATrSlim(
+        in_v_channels=3,
+        out_v_channels=2,
+        hidden_v_channels=8,
+        in_s_channels=4,
+        out_s_channels=5,
+        hidden_s_channels=6,
+        num_blocks=1,
+        num_heads=2,
+        in_p_channels=2,
+        out_p_channels=3,
+        hidden_p_channels=4,
+    )
+
+    assert type(layer) is LGATrSlimPseudo
+
+    vectors = torch.randn(7, 11, 3, 4)
+    scalars = torch.randn(7, 11, 4)
+    pseudoscalars = torch.randn(7, 11, 2)
+
+    out_v, out_s, out_p = layer(vectors, scalars, pseudoscalars)
+
+    assert out_v.shape == (7, 11, 2, 4)
+    assert out_s.shape == (7, 11, 5)
+    assert out_p.shape == (7, 11, 3)

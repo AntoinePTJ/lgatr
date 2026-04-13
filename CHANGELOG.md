@@ -56,8 +56,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Import `LGATrSlim` and `ConditionalLGATrSlim` from `lgatr.nets`
 - Improve `LGATrSlim`/`ConditionalLGATrSlim` amp handling
 - `LGATrSlimPseudo` with a dedicated pseudoscalar stream and vector-to-pseudoscalar map
+- Optional pseudoscalar channels in `LGATrSlim`, backed by a new LGATrSlimPseudo architecture
 - Unit tests for `LGATrSlimPseudo`
-- Documentation for `LGATrSlimPseudo`
+- Documentation for pseudoscalar-enabled `LGATrSlim`
 
 ## [1.4.3] - 27.01.2026
 
