@@ -36,6 +36,15 @@ class LGATrSlim(nn.Module):
         Number of hidden scalar channels.
     num_heads
         Number of attention heads.
+    in_p_channels
+        Number of input pseudoscalar channels. If ``hidden_p_channels`` or ``out_p_channels`` is
+        nonzero, construction dispatches to :class:`~lgatr.nets.slim_pseudo.LGATrSlimPseudo`.
+    out_p_channels
+        Number of output pseudoscalar channels. If nonzero, construction dispatches to
+        :class:`~lgatr.nets.slim_pseudo.LGATrSlimPseudo`.
+    hidden_p_channels
+        Number of hidden pseudoscalar channels. If nonzero, construction dispatches to
+        :class:`~lgatr.nets.slim_pseudo.LGATrSlimPseudo`.
     nonlinearity
         Nonlinearity for the MLP layers.
     nonlinearity_v
@@ -72,6 +81,33 @@ class LGATrSlim(nn.Module):
         values (down to ~0.3) reduce the activation-memory peak at a modest backward-compute cost.
     """
 
+    def __new__(
+        cls,
+        *args,
+        in_p_channels: int = 0,
+        out_p_channels: int = 0,
+        hidden_p_channels: int = 0,
+        **kwargs,
+    ):
+        # LGATrSlim is the public entry point for the slim family: requesting pseudoscalar
+        # channels transparently builds the pseudoscalar-enabled network instead.
+        from .slim_pseudo import LGATrSlimPseudo
+
+        if cls is LGATrSlim and hidden_p_channels + out_p_channels != 0:
+            if len(args) > 7:
+                raise ValueError(
+                    "Positional arguments conflict with pseudoscalar channels. "
+                    "Only num_blocks and the vector/scalar channels can be passed positionally."
+                )
+            return LGATrSlimPseudo(
+                *args,
+                in_p_channels=in_p_channels,
+                out_p_channels=out_p_channels,
+                hidden_p_channels=hidden_p_channels,
+                **kwargs,
+            )
+        return super().__new__(cls)
+
     def __init__(
         self,
         num_blocks: int,
@@ -82,6 +118,9 @@ class LGATrSlim(nn.Module):
         out_s_channels: int,
         hidden_s_channels: int,
         num_heads: int,
+        in_p_channels: int = 0,
+        out_p_channels: int = 0,
+        hidden_p_channels: int = 0,
         nonlinearity: str = "gelu",
         nonlinearity_v: str | None = "sigmoid",
         mlp_ratio: int = 2,
