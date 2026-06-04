@@ -439,6 +439,98 @@ class SelfAttention(nn.Module):
         return outputs_v, outputs_s
 
 
+class PhysicsAttention(nn.Module):
+    """Linear-complexity attention via learned slice pooling (Transolver, Wu et al. 2024).
+
+    Compresses N items into M physics-aware tokens by soft assignment, applies self-attention
+    among the M tokens, then broadcasts back. Complexity O(N·M + M²) vs O(N²).
+
+    Slice weights depend on scalar features and on the Lorentz Gram-matrix invariants
+    ``G_{n,cc'} = v_{n,c} · v_{n,c'}`` (Minkowski inner product between channels), computed
+    directly without any intermediate projection.
+
+    Parameters
+    ----------
+    v_channels
+        Number of vector channels.
+    s_channels
+        Number of scalar channels.
+    num_heads
+        Number of attention heads for the inner token attention.
+    num_slices
+        Number of physics-aware tokens M.
+    attn_ratio
+        Expansion ratio for the inner attention hidden channels.
+    dropout_prob
+        Dropout probability.
+    """
+
+    def __init__(
+        self,
+        v_channels: int,
+        s_channels: int,
+        num_heads: int,
+        num_slices: int,
+        attn_ratio: int = 1,
+        dropout_prob: float | None = None,
+    ) -> None:
+        super().__init__()
+        self.num_slices = num_slices
+        self.register_buffer("metric", torch.tensor([1.0, -1.0, -1.0, -1.0]), persistent=False)
+        self.slice_linear_s = nn.Linear(s_channels, num_slices, bias=False)
+        self.slice_linear_v = nn.Linear(v_channels * v_channels, num_slices, bias=False)
+        self.inner_attention = SelfAttention(
+            v_channels=v_channels,
+            s_channels=s_channels,
+            num_heads=num_heads,
+            attn_ratio=attn_ratio,
+            dropout_prob=dropout_prob,
+        )
+
+    @minimum_autocast_precision(torch.float32)
+    def _slice_weights(self, vectors: torch.Tensor, scalars: torch.Tensor) -> torch.Tensor:
+        # Lorentz Gram matrix: G_{cc'} = v_c · v_{c'} under metric [1,-1,-1,-1]
+        gram = torch.einsum("...ic,...jc->...ij", vectors * self.metric, vectors)
+        logits = self.slice_linear_s(scalars) + self.slice_linear_v(gram.flatten(-2))
+        return logits.softmax(dim=-1)  # (..., N, M), each item sums to 1 over slices
+
+    def forward(
+        self, vectors: torch.Tensor, scalars: torch.Tensor, **attn_kwargs
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply physics-attention.
+
+        Parameters
+        ----------
+        vectors
+            Lorentz vectors of shape ``(..., N, v_channels, 4)``.
+        scalars
+            Scalar features of shape ``(..., N, s_channels)``.
+        **attn_kwargs
+            Accepted for interface compatibility; not forwarded to inner attention.
+
+        Returns
+        -------
+        outputs_v
+            Lorentz vectors of shape ``(..., N, v_channels, 4)``.
+        outputs_s
+            Scalar features of shape ``(..., N, s_channels)``.
+        """
+        w = self._slice_weights(vectors, scalars)  # (..., N, M)
+        denom = w.sum(dim=-2)  # (..., M)
+
+        # Encode M physics-aware tokens by weighted average over N items
+        z_v = torch.einsum("...nm,...nvc->...mvc", w, vectors) / denom[..., None, None]
+        z_s = torch.einsum("...nm,...nd->...md", w, scalars) / denom[..., None]
+
+        # Self-attention among M tokens
+        z_v, z_s = self.inner_attention(z_v, z_s)
+
+        # Deslice: broadcast token outputs back to N items
+        out_v = torch.einsum("...nm,...mvc->...nvc", w, z_v)
+        out_s = torch.einsum("...nm,...md->...nd", w, z_s)
+        return out_v, out_s
+
+
 class MLP(nn.Module):
     """Multi-layer perceptron for vector and scalar features.
 
@@ -554,6 +646,9 @@ class LGATrSlimBlock(nn.Module):
         Number of layers in the MLP.
     dropout_prob
         Dropout probability.
+    num_slices
+        If set, use :class:`PhysicsAttention` with this many slices instead of standard
+        O(N²) self-attention.
 
     """
 
@@ -569,19 +664,30 @@ class LGATrSlimBlock(nn.Module):
         num_layers_mlp: int = 2,
         dropout_prob: float | None = None,
         norm_elementwise_affine: bool = True,
+        num_slices: int | None = None,
     ) -> None:
         super().__init__()
 
         self.norm1 = RMSNorm(v_channels, s_channels, elementwise_affine=norm_elementwise_affine)
         self.norm2 = RMSNorm(v_channels, s_channels, elementwise_affine=norm_elementwise_affine)
 
-        self.attention = SelfAttention(
-            v_channels=v_channels,
-            s_channels=s_channels,
-            num_heads=num_heads,
-            attn_ratio=attn_ratio,
-            dropout_prob=dropout_prob,
-        )
+        if num_slices is not None:
+            self.attention = PhysicsAttention(
+                v_channels=v_channels,
+                s_channels=s_channels,
+                num_heads=num_heads,
+                num_slices=num_slices,
+                attn_ratio=attn_ratio,
+                dropout_prob=dropout_prob,
+            )
+        else:
+            self.attention = SelfAttention(
+                v_channels=v_channels,
+                s_channels=s_channels,
+                num_heads=num_heads,
+                attn_ratio=attn_ratio,
+                dropout_prob=dropout_prob,
+            )
 
         self.mlp = MLP(
             v_channels=v_channels,
@@ -673,6 +779,9 @@ class LGATrSlim(nn.Module):
         Number of layers in each MLP.
     dropout_prob
         Dropout probability.
+    num_slices
+        If set, every block uses :class:`PhysicsAttention` with this many slices instead of
+        standard O(N²) self-attention. Recommended: 32–128 depending on mesh size.
     checkpoint_blocks
         Whether to use gradient checkpointing for the blocks.
     compile
@@ -700,6 +809,7 @@ class LGATrSlim(nn.Module):
         num_layers_mlp: int = 2,
         dropout_prob: float | None = None,
         norm_elementwise_affine: bool = True,
+        num_slices: int | None = None,
         checkpoint_blocks: bool = False,
         compile: bool = False,
         **compile_kwargs,
@@ -726,6 +836,7 @@ class LGATrSlim(nn.Module):
                     num_layers_mlp=num_layers_mlp,
                     dropout_prob=dropout_prob,
                     norm_elementwise_affine=norm_elementwise_affine,
+                    num_slices=num_slices,
                 )
                 for _ in range(num_blocks)
             ]
