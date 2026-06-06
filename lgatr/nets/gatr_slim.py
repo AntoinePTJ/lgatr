@@ -402,7 +402,12 @@ class SelfAttention(nn.Module):
         return q, k, v
 
     def forward(
-        self, vectors: torch.Tensor, scalars: torch.Tensor, **attn_kwargs
+        self,
+        vectors: torch.Tensor,
+        scalars: torch.Tensor,
+        centroid_mask: torch.Tensor | None = None,
+        batch_ids: torch.Tensor | None = None,
+        **attn_kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply self-attention.
 
@@ -412,6 +417,8 @@ class SelfAttention(nn.Module):
             Euclidean vectors of shape ``(..., items, v_channels, 3)``.
         scalars
             Scalar features of shape ``(..., items, s_channels)``.
+        centroid_mask, batch_ids
+            Accepted for interface compatibility with :class:`PhysicsAttention`; ignored here.
         **attn_kwargs
             Optional keyword arguments forwarded to attention.
 
@@ -444,6 +451,18 @@ class PhysicsAttention(nn.Module):
     Slice weights depend on scalar features and on vector Gram-matrix invariants
     ``G_{n,cc'} = v_{n,c} · v_{n,c'}`` — the full set of O(3)-invariant pairwise dot products
     between vector channels, computed directly without any intermediate projection.
+
+    For translation equivariance, the Gram matrix is computed on mean-centred vectors
+    (centroid subtracted over real items).  Two complementary keyword arguments control this:
+
+    * ``centroid_mask`` — boolean ``(..., N)`` tensor; ``True`` marks real items that
+      contribute to (and receive) the centroid shift; ``False`` marks spurions (fixed
+      reference vectors such as a wind-tunnel axis) or padding that must be left at their
+      absolute values.
+    * ``batch_ids`` — long ``(N_total,)`` tensor for the *varlen / concatenated-events*
+      case where events of different sizes are stacked into a flat sequence without padding.
+      Each value is an event index in ``[0, n_events)``.  When provided, a per-event
+      scatter mean is used so the centroid of each event is computed independently.
 
     Parameters
     ----------
@@ -483,33 +502,80 @@ class PhysicsAttention(nn.Module):
         )
 
     @minimum_autocast_precision(torch.float32)
-    def _slice_weights(self, vectors: torch.Tensor, scalars: torch.Tensor) -> torch.Tensor:
-        gram = torch.einsum("...ic,...jc->...ij", vectors, vectors)  # (..., N, vc, vc)
+    def _slice_weights(
+        self,
+        vectors: torch.Tensor,
+        scalars: torch.Tensor,
+        centroid_mask: torch.Tensor | None = None,
+        batch_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if batch_ids is not None:
+            # Varlen path: scatter mean per event so each event gets its own centroid.
+            n_events = int(batch_ids.max().item()) + 1
+            mask_f = (
+                centroid_mask.to(vectors.dtype)
+                if centroid_mask is not None
+                else vectors.new_ones(vectors.shape[0])
+            )  # (N_total,)
+            ids = batch_ids[:, None, None].expand_as(vectors)  # (N_total, vc, 3)
+            sum_v = vectors.new_zeros(n_events, vectors.shape[-2], vectors.shape[-1])
+            sum_v.scatter_add_(0, ids, vectors * mask_f[:, None, None])
+            count = vectors.new_zeros(n_events, 1, 1)
+            count.scatter_add_(
+                0, batch_ids[:, None, None].expand(-1, 1, 1), mask_f[:, None, None].expand(-1, 1, 1)
+            )
+            count = count.clamp(min=1.0)
+            offset = (sum_v / count)[batch_ids]  # (N_total, vc, 3)
+            v_for_gram = vectors - offset * mask_f[:, None, None]
+        elif centroid_mask is not None:
+            # Padded-batch path: masked mean per batch element.
+            mask_f = centroid_mask[..., None, None].to(vectors.dtype)  # (..., N, 1, 1)
+            count = mask_f.sum(dim=-3, keepdim=True).clamp(min=1.0)  # (..., 1, 1, 1)
+            offset = (vectors * mask_f).sum(dim=-3, keepdim=True) / count  # (..., 1, vc, 3)
+            # Shift real items by centroid; spurions (mask=0) are unaffected.
+            v_for_gram = vectors - offset * mask_f
+        else:
+            v_for_gram = vectors - vectors.mean(dim=-3, keepdim=True)
+        gram = torch.einsum("...ic,...jc->...ij", v_for_gram, v_for_gram)  # (..., N, vc, vc)
         logits = self.slice_linear_s(scalars) + self.slice_linear_v(gram.flatten(-2))
         return logits.softmax(dim=-1)  # (..., N, M), each item sums to 1 over slices
 
     def forward(
-        self, vectors: torch.Tensor, scalars: torch.Tensor, **attn_kwargs
+        self,
+        vectors: torch.Tensor,
+        scalars: torch.Tensor,
+        centroid_mask: torch.Tensor | None = None,
+        batch_ids: torch.Tensor | None = None,
+        **attn_kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply physics-attention.
 
         Parameters
         ----------
         vectors
-            Euclidean vectors of shape ``(..., N, v_channels, 3)``.
+            Euclidean vectors of shape ``(..., N, v_channels, 3)`` (padded batch) or
+            ``(N_total, v_channels, 3)`` (varlen / concatenated events).
         scalars
-            Scalar features of shape ``(..., N, s_channels)``.
+            Scalar features, same leading shape as ``vectors``.
+        centroid_mask
+            Boolean tensor of shape ``(..., N)`` or ``(N_total,)``.  ``True`` marks a real
+            item that contributes to (and receives) the translation centroid; ``False`` marks
+            spurions or padding.  ``None`` treats every item as real.
+        batch_ids
+            Long tensor of shape ``(N_total,)`` for the varlen case.  Each value is an event
+            index in ``[0, n_events)``.  Triggers per-event scatter-mean centroid computation.
+            Must be ``None`` for padded-batch inputs.
         **attn_kwargs
             Accepted for interface compatibility; not forwarded to inner attention.
 
         Returns
         -------
-        outputs_v
-            Euclidean vectors of shape ``(..., N, v_channels, 3)``.
-        outputs_s
-            Scalar features of shape ``(..., N, s_channels)``.
+        outputs_v, outputs_s
+            Same shape as inputs.
         """
-        w = self._slice_weights(vectors, scalars)  # (..., N, M)
+        w = self._slice_weights(
+            vectors, scalars, centroid_mask=centroid_mask, batch_ids=batch_ids
+        )  # (..., N, M) or (N_total, M)
         denom = w.sum(dim=-2)  # (..., M)
 
         # Encode M physics-aware tokens by weighted average over N items
@@ -647,6 +713,10 @@ class GATrSlimBlock(nn.Module):
         If set, use :class:`PhysicsAttention` with this many slices instead of standard
         O(N²) self-attention.
 
+    Notes
+    -----
+    When ``num_slices`` is set, ``centroid_mask`` and/or ``batch_ids`` may be passed to
+    :meth:`forward` to control per-event translation centring; see :class:`PhysicsAttention`.
     """
 
     def __init__(
@@ -778,7 +848,9 @@ class GATrSlim(nn.Module):
         Dropout probability.
     num_slices
         If set, every block uses :class:`PhysicsAttention` with this many slices instead of
-        standard O(N²) self-attention.
+        standard O(N²) self-attention.  In this mode ``centroid_mask`` and/or ``batch_ids``
+        may be passed to :meth:`forward` for per-event translation centring; see
+        :class:`PhysicsAttention`.
     checkpoint_blocks
         Whether to use gradient checkpointing for the blocks.
     compile
