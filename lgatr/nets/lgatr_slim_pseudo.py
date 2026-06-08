@@ -160,6 +160,7 @@ class Linear(nn.Module):
     Supports optional mixing between vector and scalar features to improve expressivity.
     Pseudoscalar outputs receive both a linear pseudoscalar contribution and a parity-odd
     contribution generated from the vector inputs through ``VectorToPseudoscalar``.
+    Scalar outputs receive an additional parity-even contribution from squared pseudoscalars.
     """
 
     def __init__(
@@ -213,6 +214,7 @@ class Linear(nn.Module):
             )
         )
         self.linear_s = nn.Linear(in_s_channels, out_s_channels, bias=bias)
+        self.p_to_s = nn.Linear(in_p_channels, out_s_channels, bias=False)
         self.linear_p = nn.Linear(in_p_channels, out_p_channels, bias=False)
         self.vector_to_p = VectorToPseudoscalar(in_v_channels, out_p_channels)
 
@@ -235,7 +237,7 @@ class Linear(nn.Module):
             Tensors of the same shape as input representing the transformed vectors, scalars, and pseudoscalars.
         """
         vectors_out = self.weight_v @ vectors
-        scalars_out = self.linear_s(scalars)
+        scalars_out = self.linear_s(scalars) + self.p_to_s(pseudoscalars.pow(2))
         pseudoscalars_out = self.linear_p(pseudoscalars) + self.vector_to_p(vectors)
         return vectors_out, scalars_out, pseudoscalars_out
 
@@ -262,6 +264,7 @@ class Linear(nn.Module):
         fan_in = max(self._in_p_channels, 1)
         bound = p_factor / math.sqrt(fan_in)
         nn.init.uniform_(self.linear_p.weight, a=-bound, b=bound)
+        nn.init.uniform_(self.p_to_s.weight, a=-bound, b=bound)
         self.vector_to_p.reset_parameters(p_factor)
 
 
@@ -708,7 +711,7 @@ class LGATrSlimPseudo(nn.Module):
             # note that we need fullgraph=False because of the torch.compiler.disable for attention
             self.__class__ = torch.compile(self.__class__, dynamic=True, mode="default")
 
-    def forward(self, vectors, scalars, pseudoscalars = None, **attn_kwargs):
+    def forward(self, vectors, scalars, pseudoscalars=None, **attn_kwargs):
         """
         Parameters
         ----------
@@ -728,9 +731,13 @@ class LGATrSlimPseudo(nn.Module):
         """
 
         if pseudoscalars is None and self.linear_in._in_p_channels == 0:
-            pseudoscalars = torch.empty(scalars.shape[:-1] + (0,), device=scalars.device, dtype=scalars.dtype)
+            pseudoscalars = torch.empty(
+                scalars.shape[:-1] + (0,), device=scalars.device, dtype=scalars.dtype
+            )
         else:
-            assert pseudoscalars is not None, "Pseudoscalar input cannot be None if the model expects pseudoscalar channels."
+            assert pseudoscalars is not None, (
+                "Pseudoscalar input cannot be None if the model expects pseudoscalar channels."
+            )
 
         h_v, h_s, h_p = self.linear_in(vectors, scalars, pseudoscalars)
 
