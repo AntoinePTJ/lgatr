@@ -321,6 +321,93 @@ class GatedLinearUnit(nn.Module):
         return 0.5 * ((v_gates_1 * v_gates_2) * self.metric).sum(dim=-1, keepdim=True)
 
 
+class IRCSafeEmbedding(nn.Module):
+    """IRC-safe embedding that aggregates a particle cloud into learned latent tokens.
+
+    Energy-weighted cross-attention with learned latent queries: the output is a fixed set of
+    ``num_latents`` tokens, so soft or collinear-split particles never appear as tokens
+    downstream. Attention logits are computed from the input scalars only; vector values enter
+    linearly. Contributions of a particle to the latents vanish linearly with its energy weight
+    (infrared safety) and are additive under collinear splits (collinear safety), provided that
+
+    - the input scalars are functions of the particle direction only (e.g. ``eta``,
+      ``sin(phi)``, ``cos(phi)``), so that collinear daughters carry identical scalars, and
+    - the energy weights are linear in the particle energy (e.g. ``pt_i / sum(pt)``).
+
+    Padded particles must have zero vectors and zero energy weight.
+
+    Parameters
+    ----------
+    in_v_channels
+        Number of input vector channels.
+    out_v_channels
+        Number of output vector channels.
+    in_s_channels
+        Number of input scalar channels.
+    out_s_channels
+        Number of output scalar channels.
+    num_latents
+        Number of latent output tokens.
+    """
+
+    def __init__(
+        self,
+        in_v_channels: int,
+        out_v_channels: int,
+        in_s_channels: int,
+        out_s_channels: int,
+        num_latents: int,
+    ) -> None:
+        super().__init__()
+        self.num_latents = num_latents
+        # learned latent queries are folded into this map: logits[..., a] = q_a . k(scalars)
+        self.logits = nn.Linear(in_s_channels, num_latents)
+        self.value = Linear(
+            in_v_channels=in_v_channels,
+            out_v_channels=out_v_channels,
+            in_s_channels=in_s_channels,
+            out_s_channels=out_s_channels,
+        )
+
+    @minimum_autocast_precision(torch.float32)
+    def forward(
+        self, vectors: torch.Tensor, scalars: torch.Tensor, energy_weights: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Aggregate particles into latent tokens.
+
+        Parameters
+        ----------
+        vectors
+            Lorentz vectors of shape ``(..., items, in_v_channels, 4)``.
+        scalars
+            Direction-only scalar features of shape ``(..., items, in_s_channels)``.
+        energy_weights
+            Energy fractions of shape ``(..., items)``, e.g. ``pt / pt.sum(-1, keepdim=True)``;
+            zero for padded particles.
+
+        Returns
+        -------
+        outputs_v
+            Lorentz vectors of shape ``(..., num_latents, out_v_channels, 4)``.
+        outputs_s
+            Scalar features of shape ``(..., num_latents, out_s_channels)``.
+        """
+        logits = self.logits(scalars).movedim(-1, -2)  # (..., num_latents, items)
+        kernel = torch.exp(logits - logits.amax(dim=-1, keepdim=True))
+
+        z = energy_weights.unsqueeze(-2)  # (..., 1, items)
+        denom = (kernel * z).sum(dim=-1, keepdim=True).clamp_min(1e-20)
+        # vector values are already linear in the momenta, so they are weighted by the kernel
+        # alone; weighting them by z as well would break collinear additivity
+        weights_v = kernel / denom
+        weights_s = kernel * z / denom
+
+        v_val, s_val = self.value(vectors, scalars)
+        outputs_v = torch.einsum("...ni,...icd->...ncd", weights_v, v_val)
+        outputs_s = torch.einsum("...ni,...ic->...nc", weights_s, s_val)
+        return outputs_v, outputs_s
+
+
 class SelfAttention(nn.Module):
     """Self-attention for Lorentz vectors and scalar features.
 
@@ -673,6 +760,11 @@ class LGATrSlim(nn.Module):
         Number of layers in each MLP.
     dropout_prob
         Dropout probability.
+    num_latents
+        When set, an :class:`IRCSafeEmbedding` aggregates the particle cloud into this many
+        latent tokens before ``linear_in``, making the network IRC safe (see
+        :class:`IRCSafeEmbedding` for the conditions on the inputs). ``forward`` then requires
+        ``energy_weights`` and returns ``num_latents`` tokens instead of one token per particle.
     checkpoint_blocks
         Whether to use gradient checkpointing for the blocks.
     compile
@@ -699,12 +791,25 @@ class LGATrSlim(nn.Module):
         attn_ratio: int = 1,
         num_layers_mlp: int = 2,
         dropout_prob: float | None = None,
+        num_latents: int | None = None,
         norm_elementwise_affine: bool = True,
         checkpoint_blocks: bool = False,
         compile: bool = False,
         **compile_kwargs,
     ) -> None:
         super().__init__()
+
+        self.irc_embedding: IRCSafeEmbedding | None
+        if num_latents is not None:
+            self.irc_embedding = IRCSafeEmbedding(
+                in_v_channels=in_v_channels,
+                in_s_channels=in_s_channels,
+                out_v_channels=in_v_channels,
+                out_s_channels=in_s_channels,
+                num_latents=num_latents,
+            )
+        else:
+            self.irc_embedding = None
 
         self.linear_in = Linear(
             in_v_channels=in_v_channels,
@@ -743,7 +848,11 @@ class LGATrSlim(nn.Module):
             compile_model(self, **compile_kwargs)
 
     def forward(
-        self, vectors: torch.Tensor, scalars: torch.Tensor, **attn_kwargs
+        self,
+        vectors: torch.Tensor,
+        scalars: torch.Tensor,
+        energy_weights: torch.Tensor | None = None,
+        **attn_kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass.
 
@@ -753,16 +862,28 @@ class LGATrSlim(nn.Module):
             Lorentz vectors of shape ``(..., items, in_v_channels, 4)``.
         scalars
             Scalar features of shape ``(..., items, in_s_channels)``.
+        energy_weights
+            Energy fractions of shape ``(..., items)``. Required when the network was
+            constructed with ``num_latents``; see :class:`IRCSafeEmbedding`.
         **attn_kwargs
             Optional keyword arguments forwarded to attention.
 
         Returns
         -------
         outputs_v
-            Lorentz vectors of shape ``(..., items, out_v_channels, 4)``.
+            Lorentz vectors of shape ``(..., items, out_v_channels, 4)``; with ``num_latents``
+            set, ``items`` is replaced by ``num_latents``.
         outputs_s
-            Scalar features of shape ``(..., items, out_s_channels)``.
+            Scalar features of shape ``(..., items, out_s_channels)``; with ``num_latents``
+            set, ``items`` is replaced by ``num_latents``.
         """
+        if self.irc_embedding is not None:
+            if energy_weights is None:
+                raise ValueError("energy_weights is required when num_latents is set")
+            vectors, scalars = self.irc_embedding(vectors, scalars, energy_weights)
+        elif energy_weights is not None:
+            raise ValueError("energy_weights is only supported when num_latents is set")
+
         h_v, h_s = self.linear_in(vectors, scalars)
 
         for block in self.blocks:

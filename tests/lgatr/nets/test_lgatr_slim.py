@@ -5,6 +5,7 @@ from lgatr.nets.lgatr_slim import (
     MLP,
     Dropout,
     GatedLinearUnit,
+    IRCSafeEmbedding,
     LGATrSlim,
     LGATrSlimBlock,
     Linear,
@@ -335,3 +336,134 @@ def test_LGATrSlim_equivariance_compiled(
     # equivariance
     batch_dims = batch_dims + [in_v_channels]
     check_equivariance(layer, batch_dims=batch_dims, fn_kwargs=dict(scalars=s), **TOLERANCES)
+
+
+def _random_massless_cloud(
+    batch_dims: list[int], num_items: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Random massless momenta with direction-only scalars and pt-fraction energy weights."""
+    pt = torch.rand(*batch_dims, num_items) + 0.1
+    eta = torch.randn(*batch_dims, num_items)
+    phi = 2 * torch.pi * torch.rand(*batch_dims, num_items)
+
+    p = torch.stack(
+        [pt * torch.cosh(eta), pt * torch.cos(phi), pt * torch.sin(phi), pt * torch.sinh(eta)],
+        dim=-1,
+    )
+    scalars = torch.stack([eta, torch.cos(phi), torch.sin(phi)], dim=-1)
+    z = pt / pt.sum(dim=-1, keepdim=True)
+    return p, scalars, z
+
+
+def _make_irc_safe_net(num_latents: int = 4) -> LGATrSlim:
+    net = LGATrSlim(
+        in_v_channels=1,
+        out_v_channels=2,
+        hidden_v_channels=8,
+        in_s_channels=3,
+        out_s_channels=2,
+        hidden_s_channels=8,
+        num_blocks=2,
+        num_heads=2,
+        num_latents=num_latents,
+    )
+    net.eval()
+    return net
+
+
+@pytest.mark.parametrize("batch_dims", BATCH_DIMS)
+@pytest.mark.parametrize("num_latents", [1, 4])
+def test_IRCSafeEmbedding_shape_and_equivariance(batch_dims: list[int], num_latents: int) -> None:
+    # IRCSafeEmbedding outputs num_latents tokens and is SO(1, 3)-equivariant.
+    in_v_channels, in_s_channels = 2, 3
+    num_items = 7
+    layer = IRCSafeEmbedding(
+        in_v_channels=in_v_channels,
+        out_v_channels=5,
+        in_s_channels=in_s_channels,
+        out_s_channels=4,
+        num_latents=num_latents,
+    )
+    v = torch.randn(*batch_dims, num_items, in_v_channels, 4)
+    s = torch.randn(*batch_dims, num_items, in_s_channels)
+    z = torch.rand(*batch_dims, num_items)
+    z = z / z.sum(dim=-1, keepdim=True)
+    outputs_v, outputs_s = layer(v, s, z)
+    assert outputs_v.shape == (*batch_dims, num_latents, 5, 4)
+    assert outputs_s.shape == (*batch_dims, num_latents, 4)
+
+    check_equivariance(
+        layer,
+        batch_dims=batch_dims + [num_items, in_v_channels],
+        fn_kwargs=dict(scalars=s, energy_weights=z),
+        **TOLERANCES,
+    )
+
+
+def test_LGATrSlim_irc_soft_safety() -> None:
+    # Adding a particle with vanishing energy does not change the outputs.
+    torch.manual_seed(0)
+    net = _make_irc_safe_net()
+    p, s, _ = _random_massless_cloud([2], 10)
+    pt = torch.sqrt(p[..., 1] ** 2 + p[..., 2] ** 2)
+
+    # append a soft particle with tiny pt and arbitrary direction
+    soft_scale = 1e-7
+    p_soft, s_soft, _ = _random_massless_cloud([2], 1)
+    p_aug = torch.cat([p, soft_scale * p_soft], dim=-2)
+    s_aug = torch.cat([s, s_soft], dim=-2)
+    pt_aug = torch.cat([pt, soft_scale * pt[..., :1]], dim=-1)
+
+    out_v, out_s = net(p[..., None, :], s, energy_weights=pt / pt.sum(-1, keepdim=True))
+    out_v_aug, out_s_aug = net(
+        p_aug[..., None, :], s_aug, energy_weights=pt_aug / pt_aug.sum(-1, keepdim=True)
+    )
+    torch.testing.assert_close(out_v, out_v_aug, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(out_s, out_s_aug, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("split_fraction", [0.5, 0.2])
+def test_LGATrSlim_irc_collinear_safety(split_fraction: float) -> None:
+    # Splitting a particle into two collinear daughters does not change the outputs.
+    torch.manual_seed(0)
+    net = _make_irc_safe_net()
+    p, s, _ = _random_massless_cloud([2], 10)
+    pt = torch.sqrt(p[..., 1] ** 2 + p[..., 2] ** 2)
+
+    # split the first particle: daughters share the direction (hence the scalars)
+    p_split = torch.cat(
+        [split_fraction * p[..., :1, :], (1 - split_fraction) * p[..., :1, :], p[..., 1:, :]],
+        dim=-2,
+    )
+    s_split = torch.cat([s[..., :1, :], s[..., :1, :], s[..., 1:, :]], dim=-2)
+    pt_split = torch.cat(
+        [split_fraction * pt[..., :1], (1 - split_fraction) * pt[..., :1], pt[..., 1:]], dim=-1
+    )
+
+    out_v, out_s = net(p[..., None, :], s, energy_weights=pt / pt.sum(-1, keepdim=True))
+    out_v_split, out_s_split = net(
+        p_split[..., None, :], s_split, energy_weights=pt_split / pt_split.sum(-1, keepdim=True)
+    )
+    torch.testing.assert_close(out_v, out_v_split, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out_s, out_s_split, atol=1e-5, rtol=1e-5)
+
+
+def test_LGATrSlim_irc_requires_energy_weights() -> None:
+    # energy_weights is required with num_latents and rejected without.
+    net = _make_irc_safe_net()
+    p, s, z = _random_massless_cloud([2], 5)
+    with pytest.raises(ValueError):
+        net(p[..., None, :], s)
+
+    net_plain = LGATrSlim(
+        in_v_channels=1,
+        out_v_channels=2,
+        hidden_v_channels=8,
+        in_s_channels=3,
+        out_s_channels=2,
+        hidden_s_channels=8,
+        num_blocks=1,
+        num_heads=2,
+    )
+    with pytest.raises(ValueError):
+        net_plain(p[..., None, :], s, energy_weights=z)
