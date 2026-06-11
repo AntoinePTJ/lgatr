@@ -371,27 +371,48 @@ class IRCSafeEmbedding(nn.Module):
 
     @minimum_autocast_precision(torch.float32)
     def forward(
-        self, vectors: torch.Tensor, scalars: torch.Tensor, energy_weights: torch.Tensor
+        self,
+        vectors: torch.Tensor,
+        scalars: torch.Tensor,
+        energy_weights: torch.Tensor,
+        batch: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Aggregate particles into latent tokens.
+
+        Supports two input layouts. Dense (``batch=None``): one item axis per event, padded
+        with zero vectors and zero energy weights. Sparse: particles of all events
+        concatenated along a single axis, with ``batch`` assigning each particle to its event;
+        the output then gains a leading event axis.
 
         Parameters
         ----------
         vectors
-            Lorentz vectors of shape ``(..., items, in_v_channels, 4)``.
+            Lorentz vectors of shape ``(..., items, in_v_channels, 4)``;
+            ``(num_particles, in_v_channels, 4)`` in sparse mode.
         scalars
-            Direction-only scalar features of shape ``(..., items, in_s_channels)``.
+            Direction-only scalar features of shape ``(..., items, in_s_channels)``;
+            ``(num_particles, in_s_channels)`` in sparse mode.
         energy_weights
             Energy fractions of shape ``(..., items)``, e.g. ``pt / pt.sum(-1, keepdim=True)``;
-            zero for padded particles.
+            zero for padded particles. ``(num_particles,)`` in sparse mode.
+        batch
+            Optional event indices of shape ``(num_particles,)`` (sorted, as in
+            torch_geometric). When given, the inputs are interpreted as sparse. A leading
+            event axis of size 1 on the sparse inputs (``(1, num_particles, ...)``) is
+            accepted and squeezed.
 
         Returns
         -------
         outputs_v
-            Lorentz vectors of shape ``(..., num_latents, out_v_channels, 4)``.
+            Lorentz vectors of shape ``(..., num_latents, out_v_channels, 4)``;
+            ``(num_events, num_latents, out_v_channels, 4)`` in sparse mode.
         outputs_s
-            Scalar features of shape ``(..., num_latents, out_s_channels)``.
+            Scalar features of shape ``(..., num_latents, out_s_channels)``;
+            ``(num_events, num_latents, out_s_channels)`` in sparse mode.
         """
+        if batch is not None:
+            return self._forward_sparse(vectors, scalars, energy_weights, batch)
+
         logits = self.logits(scalars).movedim(-1, -2)  # (..., num_latents, items)
         kernel = torch.exp(logits - logits.amax(dim=-1, keepdim=True))
 
@@ -405,6 +426,55 @@ class IRCSafeEmbedding(nn.Module):
         v_val, s_val = self.value(vectors, scalars)
         outputs_v = torch.einsum("...ni,...icd->...ncd", weights_v, v_val)
         outputs_s = torch.einsum("...ni,...ic->...nc", weights_s, s_val)
+        return outputs_v, outputs_s
+
+    def _forward_sparse(
+        self,
+        vectors: torch.Tensor,
+        scalars: torch.Tensor,
+        energy_weights: torch.Tensor,
+        batch: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # tolerate a leading event axis of size 1 on concatenated-event inputs
+        if vectors.ndim == 4:
+            if vectors.shape[0] != 1:
+                raise ValueError(
+                    "sparse inputs must be flat (num_particles, ...) or have a leading axis "
+                    f"of size 1, got vectors of shape {tuple(vectors.shape)}"
+                )
+            vectors = vectors.squeeze(0)
+            scalars = scalars.squeeze(0)
+            energy_weights = energy_weights.squeeze(0)
+        if batch.ndim == 2:
+            batch = batch.squeeze(0)
+
+        num_events = int(batch.amax()) + 1 if batch.numel() > 0 else 0
+
+        logits = self.logits(scalars)  # (num_particles, num_latents)
+        batch_expanded = batch.unsqueeze(-1).expand_as(logits)
+        max_logits = logits.new_zeros(num_events, self.num_latents).scatter_reduce(
+            0, batch_expanded, logits, reduce="amax", include_self=False
+        )
+        kernel = torch.exp(logits - max_logits.index_select(0, batch))
+
+        z = energy_weights.unsqueeze(-1)  # (num_particles, 1)
+        denom = (
+            logits.new_zeros(num_events, self.num_latents)
+            .index_add(0, batch, kernel * z)
+            .clamp_min(1e-20)
+        )
+
+        v_val, s_val = self.value(vectors, scalars)
+        # see the dense path for why vector values are not weighted by z
+        contrib_v = kernel[..., None, None] * v_val.unsqueeze(1)
+        contrib_s = (kernel * z).unsqueeze(-1) * s_val.unsqueeze(1)
+        outputs_v = (
+            contrib_v.new_zeros(num_events, *contrib_v.shape[1:]).index_add(0, batch, contrib_v)
+            / denom[..., None, None]
+        )
+        outputs_s = contrib_s.new_zeros(num_events, *contrib_s.shape[1:]).index_add(
+            0, batch, contrib_s
+        ) / denom.unsqueeze(-1)
         return outputs_v, outputs_s
 
 
@@ -852,6 +922,7 @@ class LGATrSlim(nn.Module):
         vectors: torch.Tensor,
         scalars: torch.Tensor,
         energy_weights: torch.Tensor | None = None,
+        batch: torch.Tensor | None = None,
         **attn_kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass.
@@ -865,6 +936,11 @@ class LGATrSlim(nn.Module):
         energy_weights
             Energy fractions of shape ``(..., items)``. Required when the network was
             constructed with ``num_latents``; see :class:`IRCSafeEmbedding`.
+        batch
+            Optional event indices for sparse (torch_geometric-style) inputs; only supported
+            with ``num_latents``. See :meth:`IRCSafeEmbedding.forward`. Note that any
+            particle-level attention mask must not be passed along in this mode; the latent
+            tokens are dense and need no mask.
         **attn_kwargs
             Optional keyword arguments forwarded to attention.
 
@@ -872,17 +948,17 @@ class LGATrSlim(nn.Module):
         -------
         outputs_v
             Lorentz vectors of shape ``(..., items, out_v_channels, 4)``; with ``num_latents``
-            set, ``items`` is replaced by ``num_latents``.
+            set, ``items`` is replaced by ``num_latents`` (with a leading event axis in sparse
+            mode).
         outputs_s
             Scalar features of shape ``(..., items, out_s_channels)``; with ``num_latents``
-            set, ``items`` is replaced by ``num_latents``.
+            set, ``items`` is replaced by ``num_latents`` (with a leading event axis in sparse
+            mode).
         """
         if self.irc_embedding is not None:
             if energy_weights is None:
                 raise ValueError("energy_weights is required when num_latents is set")
-            vectors, scalars = self.irc_embedding(vectors, scalars, energy_weights)
-        elif energy_weights is not None:
-            raise ValueError("energy_weights is only supported when num_latents is set")
+            vectors, scalars = self.irc_embedding(vectors, scalars, energy_weights, batch=batch)
 
         h_v, h_s = self.linear_in(vectors, scalars)
 
