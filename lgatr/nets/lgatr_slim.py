@@ -382,7 +382,8 @@ class IRCSafeEmbedding(nn.Module):
         Supports two input layouts. Dense (``batch=None``): one item axis per event, padded
         with zero vectors and zero energy weights. Sparse: particles of all events
         concatenated along a single axis, with ``batch`` assigning each particle to its event;
-        the output then gains a leading event axis.
+        the output latents are then concatenated along the item axis as well, with
+        ``num_latents`` tokens per event.
 
         Parameters
         ----------
@@ -405,10 +406,10 @@ class IRCSafeEmbedding(nn.Module):
         -------
         outputs_v
             Lorentz vectors of shape ``(..., num_latents, out_v_channels, 4)``;
-            ``(num_events, num_latents, out_v_channels, 4)`` in sparse mode.
+            ``(1, num_events * num_latents, out_v_channels, 4)`` in sparse mode.
         outputs_s
             Scalar features of shape ``(..., num_latents, out_s_channels)``;
-            ``(num_events, num_latents, out_s_channels)`` in sparse mode.
+            ``(1, num_events * num_latents, out_s_channels)`` in sparse mode.
         """
         if batch is not None:
             return self._forward_sparse(vectors, scalars, energy_weights, batch)
@@ -475,7 +476,7 @@ class IRCSafeEmbedding(nn.Module):
         outputs_s = contrib_s.new_zeros(num_events, *contrib_s.shape[1:]).index_add(
             0, batch, contrib_s
         ) / denom.unsqueeze(-1)
-        return outputs_v, outputs_s
+        return outputs_v.flatten(0, 1).unsqueeze(0), outputs_s.flatten(0, 1).unsqueeze(0)
 
 
 class SelfAttention(nn.Module):
@@ -938,9 +939,10 @@ class LGATrSlim(nn.Module):
             constructed with ``num_latents``; see :class:`IRCSafeEmbedding`.
         batch
             Optional event indices for sparse (torch_geometric-style) inputs; only supported
-            with ``num_latents``. See :meth:`IRCSafeEmbedding.forward`. Note that any
-            particle-level attention mask must not be passed along in this mode; the latent
-            tokens are dense and need no mask.
+            with ``num_latents``. See :meth:`IRCSafeEmbedding.forward`. The latents of all
+            events are concatenated along the item axis, so any particle-level attention mask
+            must be replaced by a latent-level block-diagonal mask with uniform blocks of size
+            ``num_latents``.
         **attn_kwargs
             Optional keyword arguments forwarded to attention.
 
@@ -948,12 +950,12 @@ class LGATrSlim(nn.Module):
         -------
         outputs_v
             Lorentz vectors of shape ``(..., items, out_v_channels, 4)``; with ``num_latents``
-            set, ``items`` is replaced by ``num_latents`` (with a leading event axis in sparse
-            mode).
+            set, ``items`` is replaced by ``num_latents`` per event
+            (``(1, num_events * num_latents, ...)`` in sparse mode).
         outputs_s
             Scalar features of shape ``(..., items, out_s_channels)``; with ``num_latents``
-            set, ``items`` is replaced by ``num_latents`` (with a leading event axis in sparse
-            mode).
+            set, ``items`` is replaced by ``num_latents`` per event
+            (``(1, num_events * num_latents, ...)`` in sparse mode).
         """
         if self.irc_embedding is not None:
             if energy_weights is None:

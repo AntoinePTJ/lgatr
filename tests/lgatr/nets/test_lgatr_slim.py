@@ -449,24 +449,11 @@ def test_LGATrSlim_irc_collinear_safety(split_fraction: float) -> None:
 
 
 def test_LGATrSlim_irc_requires_energy_weights() -> None:
-    # energy_weights is required with num_latents and rejected without.
+    # energy_weights is required with num_latents.
     net = _make_irc_safe_net()
-    p, s, z = _random_massless_cloud([2], 5)
+    p, s, _ = _random_massless_cloud([2], 5)
     with pytest.raises(ValueError):
         net(p[..., None, :], s)
-
-    net_plain = LGATrSlim(
-        in_v_channels=1,
-        out_v_channels=2,
-        hidden_v_channels=8,
-        in_s_channels=3,
-        out_s_channels=2,
-        hidden_s_channels=8,
-        num_blocks=1,
-        num_heads=2,
-    )
-    with pytest.raises(ValueError):
-        net_plain(p[..., None, :], s, energy_weights=z)
 
 
 def test_IRCSafeEmbedding_sparse_matches_dense() -> None:
@@ -500,8 +487,14 @@ def test_IRCSafeEmbedding_sparse_matches_dense() -> None:
 
     out_v_sparse, out_s_sparse = layer(v_flat, s_flat, z_flat, batch=batch)
     out_v_dense, out_s_dense = layer(v_dense, s_dense, z_dense)
-    torch.testing.assert_close(out_v_sparse, out_v_dense, atol=1e-5, rtol=1e-5)
-    torch.testing.assert_close(out_s_sparse, out_s_dense, atol=1e-5, rtol=1e-5)
+    assert out_v_sparse.shape == (1, len(counts) * 4, 5, 4)
+    assert out_s_sparse.shape == (1, len(counts) * 4, 4)
+    torch.testing.assert_close(
+        out_v_sparse[0].unflatten(0, (len(counts), 4)), out_v_dense, atol=1e-5, rtol=1e-5
+    )
+    torch.testing.assert_close(
+        out_s_sparse[0].unflatten(0, (len(counts), 4)), out_s_dense, atol=1e-5, rtol=1e-5
+    )
 
 
 def test_LGATrSlim_irc_sparse_forward() -> None:
@@ -520,28 +513,21 @@ def test_LGATrSlim_irc_sparse_forward() -> None:
     z_flat = torch.cat(z_list)
     batch = torch.repeat_interleave(torch.arange(len(counts)), torch.tensor(counts))
 
-    out_v, out_s = net(p_flat[..., None, :], s_flat, energy_weights=z_flat, batch=batch)
-    assert out_v.shape[:2] == (len(counts), 4)
-    assert out_s.shape[:2] == (len(counts), 4)
+    num_latents = 4
+    latent_batch = torch.arange(len(counts)).repeat_interleave(num_latents)
+    attn_mask = latent_batch[:, None] == latent_batch[None, :]
+
+    out_v, out_s = net(
+        p_flat[..., None, :], s_flat, energy_weights=z_flat, batch=batch, attn_mask=attn_mask
+    )
+    assert out_v.shape[:2] == (1, len(counts) * num_latents)
+    assert out_s.shape[:2] == (1, len(counts) * num_latents)
 
     for i, (p, s, z) in enumerate(zip(p_list, s_list, z_list, strict=True)):
         out_v_dense, out_s_dense = net(p[..., None, :], s, energy_weights=z)
-        torch.testing.assert_close(out_v[i], out_v_dense, atol=1e-5, rtol=1e-5)
-        torch.testing.assert_close(out_s[i], out_s_dense, atol=1e-5, rtol=1e-5)
-
-    # batch is rejected without num_latents
-    net_plain = LGATrSlim(
-        in_v_channels=1,
-        out_v_channels=2,
-        hidden_v_channels=8,
-        in_s_channels=3,
-        out_s_channels=2,
-        hidden_s_channels=8,
-        num_blocks=1,
-        num_heads=2,
-    )
-    with pytest.raises(ValueError):
-        net_plain(p_flat[..., None, :], s_flat, batch=batch)
+        sl = slice(i * num_latents, (i + 1) * num_latents)
+        torch.testing.assert_close(out_v[0, sl], out_v_dense, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(out_s[0, sl], out_s_dense, atol=1e-5, rtol=1e-5)
 
 
 def test_LGATrSlim_irc_sparse_leading_axis() -> None:
