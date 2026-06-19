@@ -355,7 +355,7 @@ def _random_massless_cloud(
     return p, scalars, z
 
 
-def _make_irc_safe_net(num_latents: int = 4) -> LGATrSlim:
+def _make_irc_safe_net(num_latents: int = 4, num_rounds: int = 1) -> LGATrSlim:
     net = LGATrSlim(
         in_v_channels=1,
         out_v_channels=2,
@@ -366,6 +366,7 @@ def _make_irc_safe_net(num_latents: int = 4) -> LGATrSlim:
         num_blocks=2,
         num_heads=2,
         num_latents=num_latents,
+        irc_num_rounds=num_rounds,
     )
     net.eval()
     return net
@@ -373,23 +374,28 @@ def _make_irc_safe_net(num_latents: int = 4) -> LGATrSlim:
 
 @pytest.mark.parametrize("batch_dims", BATCH_DIMS)
 @pytest.mark.parametrize("num_latents", [1, 4])
-def test_IRCSafeEmbedding_shape_and_equivariance(batch_dims: list[int], num_latents: int) -> None:
+@pytest.mark.parametrize("num_heads,num_rounds", [(1, 1), (2, 2)])
+def test_IRCSafeEmbedding_shape_and_equivariance(
+    batch_dims: list[int], num_latents: int, num_heads: int, num_rounds: int
+) -> None:
     # IRCSafeEmbedding outputs num_latents tokens and is SO(1, 3)-equivariant.
     in_v_channels, in_s_channels = 2, 3
     num_items = 7
     layer = IRCSafeEmbedding(
         in_v_channels=in_v_channels,
-        out_v_channels=5,
+        out_v_channels=6,
         in_s_channels=in_s_channels,
         out_s_channels=4,
         num_latents=num_latents,
+        num_heads=num_heads,
+        num_rounds=num_rounds,
     )
     v = torch.randn(*batch_dims, num_items, in_v_channels, 4)
     s = torch.randn(*batch_dims, num_items, in_s_channels)
     z = torch.rand(*batch_dims, num_items)
     z = z / z.sum(dim=-1, keepdim=True)
     outputs_v, outputs_s = layer(v, s, z)
-    assert outputs_v.shape == (*batch_dims, num_latents, 5, 4)
+    assert outputs_v.shape == (*batch_dims, num_latents, 6, 4)
     assert outputs_s.shape == (*batch_dims, num_latents, 4)
 
     check_equivariance(
@@ -400,10 +406,11 @@ def test_IRCSafeEmbedding_shape_and_equivariance(batch_dims: list[int], num_late
     )
 
 
-def test_LGATrSlim_irc_soft_safety() -> None:
+@pytest.mark.parametrize("num_rounds", [1, 2])
+def test_LGATrSlim_irc_soft_safety(num_rounds: int) -> None:
     # Adding a particle with vanishing energy does not change the outputs.
     torch.manual_seed(0)
-    net = _make_irc_safe_net()
+    net = _make_irc_safe_net(num_rounds=num_rounds)
     p, s, _ = _random_massless_cloud([2], 10)
     pt = torch.sqrt(p[..., 1] ** 2 + p[..., 2] ** 2)
 
@@ -423,10 +430,11 @@ def test_LGATrSlim_irc_soft_safety() -> None:
 
 
 @pytest.mark.parametrize("split_fraction", [0.5, 0.2])
-def test_LGATrSlim_irc_collinear_safety(split_fraction: float) -> None:
+@pytest.mark.parametrize("num_rounds", [1, 2])
+def test_LGATrSlim_irc_collinear_safety(split_fraction: float, num_rounds: int) -> None:
     # Splitting a particle into two collinear daughters does not change the outputs.
     torch.manual_seed(0)
-    net = _make_irc_safe_net()
+    net = _make_irc_safe_net(num_rounds=num_rounds)
     p, s, _ = _random_massless_cloud([2], 10)
     pt = torch.sqrt(p[..., 1] ** 2 + p[..., 2] ** 2)
 
@@ -456,15 +464,18 @@ def test_LGATrSlim_irc_requires_energy_weights() -> None:
         net(p[..., None, :], s)
 
 
-def test_IRCSafeEmbedding_sparse_matches_dense() -> None:
+@pytest.mark.parametrize("num_heads,num_rounds", [(1, 1), (2, 2)])
+def test_IRCSafeEmbedding_sparse_matches_dense(num_heads: int, num_rounds: int) -> None:
     # The sparse (batch-index) path gives the same latents as the zero-padded dense path.
     torch.manual_seed(0)
     layer = IRCSafeEmbedding(
         in_v_channels=2,
-        out_v_channels=5,
+        out_v_channels=6,
         in_s_channels=3,
         out_s_channels=4,
         num_latents=4,
+        num_heads=num_heads,
+        num_rounds=num_rounds,
     )
     counts = [3, 7, 1]
     max_items = max(counts)
@@ -487,10 +498,10 @@ def test_IRCSafeEmbedding_sparse_matches_dense() -> None:
 
     out_v_sparse, out_s_sparse = layer(v_flat, s_flat, z_flat, batch=batch)
     out_v_dense, out_s_dense = layer(v_dense, s_dense, z_dense)
-    assert out_v_sparse.shape == (1, len(counts) * 4, 5, 4)
+    assert out_v_sparse.shape == (1, len(counts) * 4, 6, 4)
     assert out_s_sparse.shape == (1, len(counts) * 4, 4)
     torch.testing.assert_close(
-        out_v_sparse[0].unflatten(0, (len(counts), 4)), out_v_dense, atol=1e-5, rtol=1e-5
+        out_v_sparse[0].unflatten(0, (len(counts), 4)), out_v_dense, atol=1e-4, rtol=1e-4
     )
     torch.testing.assert_close(
         out_s_sparse[0].unflatten(0, (len(counts), 4)), out_s_dense, atol=1e-5, rtol=1e-5

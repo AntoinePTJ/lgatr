@@ -321,18 +321,57 @@ class GatedLinearUnit(nn.Module):
         return 0.5 * ((v_gates_1 * v_gates_2) * self.metric).sum(dim=-1, keepdim=True)
 
 
+class _Activation(nn.Module):
+    """Module wrapper around the functional activations of :func:`get_nonlinearity`."""
+
+    def __init__(self, label: str) -> None:
+        super().__init__()
+        self.fn = get_nonlinearity(label)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.fn(inputs)
+
+
+def _scalar_mlp(
+    in_channels: int,
+    out_channels: int,
+    hidden_channels: int,
+    num_hidden_layers: int,
+    nonlinearity: str,
+) -> nn.Sequential:
+    layers: list[nn.Module] = []
+    channels = in_channels
+    for _ in range(num_hidden_layers):
+        layers.append(nn.Linear(channels, hidden_channels))
+        layers.append(_Activation(nonlinearity))
+        channels = hidden_channels
+    layers.append(nn.Linear(channels, out_channels))
+    return nn.Sequential(*layers)
+
+
 class IRCSafeEmbedding(nn.Module):
     """IRC-safe embedding that aggregates a particle cloud into learned latent tokens.
 
     Energy-weighted cross-attention with learned latent queries: the output is a fixed set of
     ``num_latents`` tokens, so soft or collinear-split particles never appear as tokens
-    downstream. Attention logits are computed from the input scalars only; vector values enter
-    linearly. Contributions of a particle to the latents vanish linearly with its energy weight
-    (infrared safety) and are additive under collinear splits (collinear safety), provided that
+    downstream. Attention logits, scalar values, and per-channel gates on the vector values are
+    arbitrary (MLP) functions of the input scalars; vector values enter linearly in the momenta.
+    Contributions of a particle to the latents vanish linearly with its energy weight (infrared
+    safety) and are additive under collinear splits (collinear safety), provided that
 
     - the input scalars are functions of the particle direction only (e.g. ``eta``,
       ``sin(phi)``, ``cos(phi)``), so that collinear daughters carry identical scalars, and
     - the energy weights are linear in the particle energy (e.g. ``pt_i / sum(pt)``).
+
+    The last ``num_heads`` output scalar channels of each latent carry the attended energy
+    ``log(sum_i z_i exp(logit_i))`` (the log of the softmax denominator), so the latents retain
+    how much energy they captured in addition to energy-weighted averages.
+
+    With ``num_rounds > 1``, the latents cross-attend to the particles again (Perceiver-style):
+    queries are computed from the current latent scalars, keys from the particle scalars, and
+    the aggregation is added residually. Since the per-particle factors still depend only on the
+    direction scalars and contributions are still weighted linearly in the energy, the extra
+    rounds preserve IRC safety.
 
     Padded particles must have zero vectors and zero energy weight.
 
@@ -341,13 +380,28 @@ class IRCSafeEmbedding(nn.Module):
     in_v_channels
         Number of input vector channels.
     out_v_channels
-        Number of output vector channels.
+        Number of output vector channels; must be divisible by ``num_heads``.
     in_s_channels
         Number of input scalar channels.
     out_s_channels
-        Number of output scalar channels.
+        Number of output scalar channels, including the ``num_heads`` attended-energy channels;
+        must be divisible by ``num_heads`` and larger than ``num_heads``.
     num_latents
         Number of latent output tokens.
+    num_heads
+        Number of attention heads; each head has its own latent kernels and its own slice of
+        the value channels.
+    num_rounds
+        Number of aggregation rounds. The first round uses learned latent queries; subsequent
+        rounds compute queries from the current latents.
+    hidden_channels
+        Hidden width of the scalar MLPs (logits, keys, values, vector gates).
+    num_hidden_layers
+        Number of hidden layers in the scalar MLPs.
+    nonlinearity
+        Nonlinearity of the scalar MLPs.
+    key_channels
+        Per-head query/key dimension for rounds after the first.
     """
 
     def __init__(
@@ -357,17 +411,105 @@ class IRCSafeEmbedding(nn.Module):
         in_s_channels: int,
         out_s_channels: int,
         num_latents: int,
+        num_heads: int = 1,
+        num_rounds: int = 1,
+        hidden_channels: int = 32,
+        num_hidden_layers: int = 2,
+        nonlinearity: str = "gelu",
+        key_channels: int = 16,
     ) -> None:
         super().__init__()
+        if out_v_channels % num_heads != 0:
+            raise ValueError(
+                f"out_v_channels={out_v_channels} must be divisible by num_heads={num_heads}"
+            )
+        if out_s_channels <= num_heads or out_s_channels % num_heads != 0:
+            raise ValueError(
+                f"out_s_channels={out_s_channels} must be a multiple of num_heads={num_heads} "
+                "and larger than num_heads (the attended-energy channels)"
+            )
         self.num_latents = num_latents
-        # learned latent queries are folded into this map: logits[..., a] = q_a . k(scalars)
-        self.logits = nn.Linear(in_s_channels, num_latents)
-        self.value = Linear(
-            in_v_channels=in_v_channels,
-            out_v_channels=out_v_channels,
-            in_s_channels=in_s_channels,
-            out_s_channels=out_s_channels,
+        self.num_heads = num_heads
+        self.num_rounds = num_rounds
+        self._head_v_channels = out_v_channels // num_heads
+        self._head_s_channels = (out_s_channels - num_heads) // num_heads
+        self._key_channels = key_channels
+
+        # learned latent queries are folded into this map: logits[..., ha] = q_ha . k(scalars)
+        self.logits_mlp = _scalar_mlp(
+            in_s_channels, num_heads * num_latents, hidden_channels, num_hidden_layers, nonlinearity
         )
+        # learnable inverse temperature per head and latent
+        self.logit_scale = nn.Parameter(torch.ones(num_heads * num_latents))
+
+        self.value_v = nn.Linear(in_v_channels, out_v_channels, bias=False)
+        # gates multiply the vector values per channel; functions of the direction scalars keep
+        # the values linear in the momenta. Zero-init so the gates start at identity.
+        self.gate_mlp = _scalar_mlp(
+            in_s_channels, out_v_channels, hidden_channels, num_hidden_layers, nonlinearity
+        )
+        nn.init.zeros_(self.gate_mlp[-1].weight)
+        nn.init.zeros_(self.gate_mlp[-1].bias)
+        self.value_s_mlp = _scalar_mlp(
+            in_s_channels,
+            out_s_channels - num_heads,
+            hidden_channels,
+            num_hidden_layers,
+            nonlinearity,
+        )
+
+        self.key_mlp: nn.Sequential | None
+        if num_rounds > 1:
+            self.key_mlp = _scalar_mlp(
+                in_s_channels,
+                num_heads * key_channels,
+                hidden_channels,
+                num_hidden_layers,
+                nonlinearity,
+            )
+            self.query_linears = nn.ModuleList(
+                [nn.Linear(out_s_channels, num_heads * key_channels) for _ in range(num_rounds - 1)]
+            )
+        else:
+            self.key_mlp = None
+            self.query_linears = nn.ModuleList()
+
+    def _values(
+        self, vectors: torch.Tensor, scalars: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # (..., items, num_heads, head_v_channels, 4) and (..., items, num_heads, head_s_channels)
+        gates = 1.0 + self.gate_mlp(scalars)
+        v_val = torch.einsum("oc,...cd->...od", self.value_v.weight, vectors)
+        v_val = (gates.unsqueeze(-1) * v_val).unflatten(-2, (self.num_heads, self._head_v_channels))
+        s_val = self.value_s_mlp(scalars).unflatten(-1, (self.num_heads, self._head_s_channels))
+        return v_val, s_val
+
+    def _aggregate_dense(
+        self,
+        logits: torch.Tensor,
+        energy_weights: torch.Tensor,
+        v_val: torch.Tensor,
+        s_val: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # logits: (..., items, num_heads * num_latents)
+        logits = logits.movedim(-1, -2)  # (..., num_heads * num_latents, items)
+        max_logits = logits.amax(dim=-1, keepdim=True)
+        kernel = torch.exp(logits - max_logits)
+        zk = kernel * energy_weights.unsqueeze(-2)
+        denom = zk.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+        # vector values are already linear in the momenta, so they are weighted by the kernel
+        # alone; weighting them by z as well would break collinear additivity
+        weights_v = (kernel / denom).unflatten(-2, (self.num_heads, self.num_latents))
+        weights_s = (zk / denom).unflatten(-2, (self.num_heads, self.num_latents))
+
+        outputs_v = torch.einsum("...hni,...ihcd->...nhcd", weights_v, v_val).flatten(-3, -2)
+        outputs_s = torch.einsum("...hni,...ihc->...nhc", weights_s, s_val).flatten(-2, -1)
+        # the attended energy log(sum_i z_i exp(logits_i)) per latent and head is IRC safe,
+        # independent of the amax shift, and otherwise lost in the normalized averages
+        denom_feat = (max_logits + denom.log()).squeeze(-1)
+        denom_feat = denom_feat.unflatten(-1, (self.num_heads, self.num_latents)).movedim(-2, -1)
+        outputs_s = torch.cat([outputs_s, denom_feat], dim=-1)
+        return outputs_v, outputs_s
 
     @minimum_autocast_precision(torch.float32)
     def forward(
@@ -409,24 +551,68 @@ class IRCSafeEmbedding(nn.Module):
             ``(1, num_events * num_latents, out_v_channels, 4)`` in sparse mode.
         outputs_s
             Scalar features of shape ``(..., num_latents, out_s_channels)``;
-            ``(1, num_events * num_latents, out_s_channels)`` in sparse mode.
+            ``(1, num_events * num_latents, out_s_channels)`` in sparse mode. The last
+            ``num_heads`` channels are the attended energy fractions.
         """
         if batch is not None:
             return self._forward_sparse(vectors, scalars, energy_weights, batch)
 
-        logits = self.logits(scalars).movedim(-1, -2)  # (..., num_latents, items)
-        kernel = torch.exp(logits - logits.amax(dim=-1, keepdim=True))
+        v_val, s_val = self._values(vectors, scalars)
+        logits = self.logits_mlp(scalars) * self.logit_scale
+        latents_v, latents_s = self._aggregate_dense(logits, energy_weights, v_val, s_val)
 
-        z = energy_weights.unsqueeze(-2)  # (..., 1, items)
-        denom = (kernel * z).sum(dim=-1, keepdim=True).clamp_min(1e-20)
-        # vector values are already linear in the momenta, so they are weighted by the kernel
-        # alone; weighting them by z as well would break collinear additivity
-        weights_v = kernel / denom
-        weights_s = kernel * z / denom
+        if self.key_mlp is not None:
+            keys = self.key_mlp(scalars).unflatten(-1, (self.num_heads, self._key_channels))
+            for query_linear in self.query_linears:
+                queries = query_linear(latents_s).unflatten(
+                    -1, (self.num_heads, self._key_channels)
+                )
+                logits = torch.einsum("...nhd,...ihd->...ihn", queries, keys).flatten(
+                    -2, -1
+                ) / math.sqrt(self._key_channels)
+                round_v, round_s = self._aggregate_dense(logits, energy_weights, v_val, s_val)
+                latents_v = latents_v + round_v
+                latents_s = latents_s + round_s
+        return latents_v, latents_s
 
-        v_val, s_val = self.value(vectors, scalars)
-        outputs_v = torch.einsum("...ni,...icd->...ncd", weights_v, v_val)
-        outputs_s = torch.einsum("...ni,...ic->...nc", weights_s, s_val)
+    def _aggregate_sparse(
+        self,
+        logits: torch.Tensor,
+        energy_weights: torch.Tensor,
+        v_val: torch.Tensor,
+        s_val: torch.Tensor,
+        batch: torch.Tensor,
+        num_events: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # logits: (num_particles, num_heads * num_latents)
+        batch_expanded = batch.unsqueeze(-1).expand_as(logits)
+        max_logits = logits.new_zeros(num_events, logits.shape[-1]).scatter_reduce(
+            0, batch_expanded, logits, reduce="amax", include_self=False
+        )
+        kernel = torch.exp(logits - max_logits.index_select(0, batch))
+        zk = kernel * energy_weights.unsqueeze(-1)
+        denom = (
+            logits.new_zeros(num_events, logits.shape[-1])
+            .index_add(0, batch, zk)
+            .clamp_min(1e-20)
+            .unflatten(-1, (self.num_heads, self.num_latents))
+        )
+
+        kernel = kernel.unflatten(-1, (self.num_heads, self.num_latents))
+        zk = zk.unflatten(-1, (self.num_heads, self.num_latents))
+        # see the dense path for why vector values are not weighted by z
+        contrib_v = kernel[..., None, None] * v_val.unsqueeze(2)
+        contrib_s = zk[..., None] * s_val.unsqueeze(2)
+        sum_v = contrib_v.new_zeros(num_events, *contrib_v.shape[1:]).index_add(0, batch, contrib_v)
+        sum_s = contrib_s.new_zeros(num_events, *contrib_s.shape[1:]).index_add(0, batch, contrib_s)
+        # (num_events, num_latents, out_v_channels, 4) and (num_events, num_latents, out_s)
+        outputs_v = (sum_v / denom[..., None, None]).movedim(1, 2).flatten(2, 3)
+        outputs_s = (sum_s / denom[..., None]).movedim(1, 2).flatten(2, 3)
+        # see the dense path: shift-independent attended-energy feature
+        denom_feat = (
+            max_logits.unflatten(-1, (self.num_heads, self.num_latents)) + denom.log()
+        ).movedim(1, 2)
+        outputs_s = torch.cat([outputs_s, denom_feat], dim=-1)
         return outputs_v, outputs_s
 
     def _forward_sparse(
@@ -451,32 +637,28 @@ class IRCSafeEmbedding(nn.Module):
 
         num_events = int(batch.amax()) + 1 if batch.numel() > 0 else 0
 
-        logits = self.logits(scalars)  # (num_particles, num_latents)
-        batch_expanded = batch.unsqueeze(-1).expand_as(logits)
-        max_logits = logits.new_zeros(num_events, self.num_latents).scatter_reduce(
-            0, batch_expanded, logits, reduce="amax", include_self=False
-        )
-        kernel = torch.exp(logits - max_logits.index_select(0, batch))
-
-        z = energy_weights.unsqueeze(-1)  # (num_particles, 1)
-        denom = (
-            logits.new_zeros(num_events, self.num_latents)
-            .index_add(0, batch, kernel * z)
-            .clamp_min(1e-20)
+        v_val, s_val = self._values(vectors, scalars)
+        logits = self.logits_mlp(scalars) * self.logit_scale
+        latents_v, latents_s = self._aggregate_sparse(
+            logits, energy_weights, v_val, s_val, batch, num_events
         )
 
-        v_val, s_val = self.value(vectors, scalars)
-        # see the dense path for why vector values are not weighted by z
-        contrib_v = kernel[..., None, None] * v_val.unsqueeze(1)
-        contrib_s = (kernel * z).unsqueeze(-1) * s_val.unsqueeze(1)
-        outputs_v = (
-            contrib_v.new_zeros(num_events, *contrib_v.shape[1:]).index_add(0, batch, contrib_v)
-            / denom[..., None, None]
-        )
-        outputs_s = contrib_s.new_zeros(num_events, *contrib_s.shape[1:]).index_add(
-            0, batch, contrib_s
-        ) / denom.unsqueeze(-1)
-        return outputs_v.flatten(0, 1).unsqueeze(0), outputs_s.flatten(0, 1).unsqueeze(0)
+        if self.key_mlp is not None:
+            keys = self.key_mlp(scalars).unflatten(-1, (self.num_heads, self._key_channels))
+            for query_linear in self.query_linears:
+                # (num_events, num_latents, num_heads, key_channels)
+                queries = query_linear(latents_s).unflatten(
+                    -1, (self.num_heads, self._key_channels)
+                )
+                logits = torch.einsum(
+                    "inhd,ihd->ihn", queries.index_select(0, batch), keys
+                ).flatten(-2, -1) / math.sqrt(self._key_channels)
+                round_v, round_s = self._aggregate_sparse(
+                    logits, energy_weights, v_val, s_val, batch, num_events
+                )
+                latents_v = latents_v + round_v
+                latents_s = latents_s + round_s
+        return latents_v.flatten(0, 1).unsqueeze(0), latents_s.flatten(0, 1).unsqueeze(0)
 
 
 class SelfAttention(nn.Module):
@@ -836,6 +1018,12 @@ class LGATrSlim(nn.Module):
         latent tokens before ``linear_in``, making the network IRC safe (see
         :class:`IRCSafeEmbedding` for the conditions on the inputs). ``forward`` then requires
         ``energy_weights`` and returns ``num_latents`` tokens instead of one token per particle.
+    irc_num_heads
+        Number of attention heads in the :class:`IRCSafeEmbedding`; must divide
+        ``in_v_channels``. Only used when ``num_latents`` is set.
+    irc_num_rounds
+        Number of aggregation rounds in the :class:`IRCSafeEmbedding` (Perceiver-style latent
+        refinement). Only used when ``num_latents`` is set.
     checkpoint_blocks
         Whether to use gradient checkpointing for the blocks.
     compile
@@ -863,6 +1051,8 @@ class LGATrSlim(nn.Module):
         num_layers_mlp: int = 2,
         dropout_prob: float | None = None,
         num_latents: int | None = None,
+        irc_num_heads: int = 1,
+        irc_num_rounds: int = 1,
         norm_elementwise_affine: bool = True,
         checkpoint_blocks: bool = False,
         compile: bool = False,
@@ -876,15 +1066,20 @@ class LGATrSlim(nn.Module):
                 in_v_channels=in_v_channels,
                 in_s_channels=in_s_channels,
                 out_v_channels=in_v_channels,
-                out_s_channels=in_s_channels,
+                # extra channels carry the attended energy fractions
+                out_s_channels=in_s_channels + irc_num_heads,
                 num_latents=num_latents,
+                num_heads=irc_num_heads,
+                num_rounds=irc_num_rounds,
+                hidden_channels=hidden_s_channels,
+                nonlinearity=nonlinearity,
             )
         else:
             self.irc_embedding = None
 
         self.linear_in = Linear(
             in_v_channels=in_v_channels,
-            in_s_channels=in_s_channels,
+            in_s_channels=in_s_channels + (irc_num_heads if num_latents is not None else 0),
             out_v_channels=hidden_v_channels,
             out_s_channels=hidden_s_channels,
         )
