@@ -9,158 +9,259 @@ from torch.utils.checkpoint import checkpoint
 
 from ..primitives.attention import scaled_dot_product_attention
 from ..utils.autocast import minimum_autocast_precision
+from ..utils.compile import compile_model
+from ..utils.misc import get_nonlinearity
 
 
-def inner_product(x, y):
-    t = x[..., 0] * y[..., 0]
-    s = (x[..., 1:] * y[..., 1:]).sum(dim=-1)
-    return t - s
+def inner_product(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Lorentz inner product over the last (four-vector) dimension, signature ``(+, -, -, -)``."""
+    time = x[..., 0] * y[..., 0]
+    space = (x[..., 1:] * y[..., 1:]).sum(dim=-1)
+    return time - space
 
 
-def squared_norm(x):
+def squared_norm(x: torch.Tensor) -> torch.Tensor:
+    """Lorentz squared norm over the last (four-vector) dimension."""
     return inner_product(x, x)
 
 
-def get_nonlinearity(label):
-    if label == "relu":
-        return nn.ReLU()
-    elif label == "sigmoid":
-        return nn.Sigmoid()
-    elif label == "tanh":
-        return nn.Tanh()
-    elif label == "gelu":
-        return nn.GELU()
-    elif label == "silu":
-        return nn.SiLU()
-    else:
-        raise ValueError(f"Unsupported nonlinearity type: {label}")
+def _post_attention_reshape(
+    out: torch.Tensor, hidden_v_channels: int, hidden_s_channels: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split the concatenated attention output into vector, scalar, and pseudoscalar streams."""
+    v_end = hidden_v_channels * 4
+    s_end = v_end + hidden_s_channels
+    h_v = out[..., :v_end].unflatten(-1, (hidden_v_channels, 4))
+    h_s = out[..., v_end:s_end]
+    h_p = out[..., s_end:]
+
+    h_v = h_v.movedim(-3, -4).flatten(-3, -2)
+    h_s = h_s.movedim(-2, -3).flatten(-2, -1)
+    h_p = h_p.movedim(-2, -3).flatten(-2, -1)
+    return h_v, h_s, h_p
+
+
+def _call_attention(*args, **kwargs):
+    return scaled_dot_product_attention(*args, **kwargs)
 
 
 class VectorToPseudoscalar(nn.Module):
-    """Maps vectors to pseudoscalars through a learned oriented 4-volume.
+    """Map vectors to pseudoscalars through a learned oriented 4-volume.
 
     The module first projects the input channels to four learned Lorentz vectors for each output
-    pseudoscalar channel, then computes the determinant of the resulting 4x4 matrix. This produces
-    a parity-odd scalar quantity.
+    pseudoscalar channel, then takes the determinant of the resulting 4x4 matrix. The determinant
+    of four four-vectors is a parity-odd Lorentz scalar (an oriented 4-volume), so the output flips
+    sign under spatial inversion.
+
+    Parameters
+    ----------
+    in_v_channels
+        Number of input vector channels.
+    out_p_channels
+        Number of output pseudoscalar channels.
     """
 
-    def __init__(self, in_v_channels: int, out_p_channels: int):
+    def __init__(self, in_v_channels: int, out_p_channels: int) -> None:
         super().__init__()
         self._in_v_channels = in_v_channels
         self._out_p_channels = out_p_channels
         self.weight = nn.Parameter(torch.empty(out_p_channels, 4, in_v_channels))
         self.reset_parameters()
 
-    def reset_parameters(self, factor: float = 1.0):
+        # zero-size params get grads only sometimes under compile, breaking DDP
+        if self.weight.numel() == 0:
+            self.weight.requires_grad_(False)
+
+    def reset_parameters(self, factor: float = 1.0) -> None:
+        """Re-initialize the projection weights."""
         fan_in = max(self._in_v_channels, 1)
         bound = factor / math.sqrt(fan_in)
         nn.init.uniform_(self.weight, a=-bound, b=bound)
 
-    def forward(self, vectors):
+    def forward(self, vectors: torch.Tensor) -> torch.Tensor:
         """Compute pseudoscalars from vector inputs.
 
         Parameters
         ----------
-        vectors : torch.Tensor
-            A tensor of shape (..., v_channels, 4) representing Lorentz vectors.
+        vectors
+            Lorentz vectors of shape ``(..., in_v_channels, 4)``.
 
         Returns
         -------
-        torch.Tensor
-            A tensor of shape (..., out_p_channels) representing pseudoscalar features.
+        pseudoscalars
+            Pseudoscalar features of shape ``(..., out_p_channels)``.
         """
         projected = torch.einsum("...cM,pac->...paM", vectors, self.weight)
         return torch.linalg.det(projected)
 
 
 class Dropout(nn.Module):
-    """Dropout module for scalar, pseudoscalar, and vector features.
+    """Dropout for vector, scalar, and pseudoscalar features.
 
-    For vector features, the same dropout mask is applied to all four components of each vector.
+    For vector features the same dropout mask is applied to all four components of each vector.
+
+    Parameters
+    ----------
+    dropout_prob
+        Dropout probability.
     """
 
-    def __init__(self, dropout_prob: float):
+    def __init__(self, dropout_prob: float) -> None:
         super().__init__()
         self._dropout_prob = dropout_prob
 
-    def forward(self, vectors, scalars, pseudoscalars):
-        """
+    def forward(
+        self, vectors: torch.Tensor, scalars: torch.Tensor, pseudoscalars: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply dropout.
+
         Parameters
         ----------
-        vectors : torch.Tensor
-            A tensor of shape (..., v_channels, 4) representing Lorentz vectors.
-        scalars : torch.Tensor
-            A tensor of shape (..., s_channels) representing scalar features.
-        pseudoscalars : torch.Tensor
-            A tensor of shape (..., p_channels) representing pseudoscalar features.
+        vectors
+            Lorentz vectors of shape ``(..., v_channels, 4)``.
+        scalars
+            Scalar features of shape ``(..., s_channels)``.
+        pseudoscalars
+            Pseudoscalar features of shape ``(..., p_channels)``.
 
         Returns
         -------
-        torch.Tensor, torch.Tensor, torch.Tensor
-            Tensors of the same shape as input representing the dropped out vectors, scalars, and pseudoscalars.
+        outputs_v
+            Lorentz vectors with dropout, same shape as ``vectors``.
+        outputs_s
+            Scalar features with dropout, same shape as ``scalars``.
+        outputs_p
+            Pseudoscalar features with dropout, same shape as ``pseudoscalars``.
         """
-        # have to reshape vectors because dropout1d constrains input shape
-        v = vectors.reshape(-1, 4)
-        out_v = dropout1d(v, p=self._dropout_prob, training=self.training)
-        out_v = out_v.reshape(vectors.shape)
+        if not self.training or self._dropout_prob == 0.0:
+            return vectors, scalars, pseudoscalars
 
-        out_s = dropout(scalars, p=self._dropout_prob, training=self.training)
-        out_p = dropout(pseudoscalars, p=self._dropout_prob, training=self.training)
-        return out_v, out_s, out_p
+        # have to reshape vectors because dropout1d constrains input shape
+        flat_v = vectors.reshape(-1, 4)
+        outputs_v = dropout1d(flat_v, p=self._dropout_prob, training=True).reshape(vectors.shape)
+        outputs_s = dropout(scalars, p=self._dropout_prob, training=True)
+        outputs_p = dropout(pseudoscalars, p=self._dropout_prob, training=True)
+        return outputs_v, outputs_s, outputs_p
 
 
 class RMSNorm(nn.Module):
-    """Normalize jointly over vector, scalar, and pseudoscalar features.
+    """Joint RMS normalization over vector, scalar, and pseudoscalar features.
 
-    For vectors, we use the absolute value of the squared norm because otherwise negative norms are possible.
+    For vectors the absolute value of the squared norm is used; otherwise the squared norm could
+    be negative under the Lorentz metric. With ``elementwise_affine`` a learnable per-channel gain
+    is applied after normalization, which requires the channel counts to be known at construction.
+
+    Parameters
+    ----------
+    v_channels
+        Number of vector channels. Required for the learnable gain; ``None`` disables affine.
+    s_channels
+        Number of scalar channels. Required for the learnable gain; ``None`` disables affine.
+    p_channels
+        Number of pseudoscalar channels. Required for the learnable gain; ``None`` disables affine.
+    epsilon
+        Small numerical offset to avoid instabilities.
+    elementwise_affine
+        Whether to apply a learnable per-channel gain. Silently disabled when the channel counts
+        are not provided (e.g. ``RMSNorm()``).
     """
 
-    def __init__(self, epsilon: float = 0.01):
+    def __init__(
+        self,
+        v_channels: int | None = None,
+        s_channels: int | None = None,
+        p_channels: int | None = None,
+        epsilon: float = 0.01,
+        elementwise_affine: bool = True,
+    ) -> None:
         super().__init__()
         self.epsilon = epsilon
+        self.elementwise_affine = elementwise_affine and None not in (
+            v_channels,
+            s_channels,
+            p_channels,
+        )
+        if self.elementwise_affine:
+            self.weight_v = nn.Parameter(torch.ones(v_channels))
+            self.weight_s = nn.Parameter(torch.ones(s_channels))
+            self.weight_p = nn.Parameter(torch.ones(p_channels))
+            # zero-size params get grads only sometimes under compile, breaking DDP
+            for weight in (self.weight_v, self.weight_s, self.weight_p):
+                if weight.numel() == 0:
+                    weight.requires_grad_(False)
+        else:
+            self.register_parameter("weight_v", None)
+            self.register_parameter("weight_s", None)
+            self.register_parameter("weight_p", None)
 
     @minimum_autocast_precision(torch.float32)
-    def forward(self, vectors, scalars, pseudoscalars):
-        """
+    def forward(
+        self, vectors: torch.Tensor, scalars: torch.Tensor, pseudoscalars: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Normalize jointly.
+
         Parameters
         ----------
-        vectors : torch.Tensor
-            A tensor of shape (..., v_channels, 4) representing Lorentz vectors.
-        scalars : torch.Tensor
-            A tensor of shape (..., s_channels) representing scalar features.
-        pseudoscalars : torch.Tensor
-            A tensor of shape (..., p_channels) representing pseudoscalar features.
+        vectors
+            Lorentz vectors of shape ``(..., v_channels, 4)``.
+        scalars
+            Scalar features of shape ``(..., s_channels)``.
+        pseudoscalars
+            Pseudoscalar features of shape ``(..., p_channels)``.
 
         Returns
         -------
-        torch.Tensor, torch.Tensor, torch.Tensor
-            Tensors of the same shape as input representing the normalized vectors, scalars, and
-            pseudoscalars.
+        outputs_v
+            Normalized Lorentz vectors, same shape as ``vectors``.
+        outputs_s
+            Normalized scalar features, same shape as ``scalars``.
+        outputs_p
+            Normalized pseudoscalar features, same shape as ``pseudoscalars``.
         """
         v_squared_norm = squared_norm(vectors).abs()
         s_squared_norm = scalars.square()
         p_squared_norm = pseudoscalars.square()
-        sum_squared_norms = (
-            v_squared_norm.sum(dim=-1) + s_squared_norm.sum(dim=-1) + p_squared_norm.sum(dim=-1)
-        )
-        mean_squared_norms = sum_squared_norms / (
-            vectors.shape[-2] + scalars.shape[-1] + pseudoscalars.shape[-1]
-        )
-        norm = torch.rsqrt(mean_squared_norms + self.epsilon).unsqueeze(-1)
+        total_features = vectors.shape[-2] + scalars.shape[-1] + pseudoscalars.shape[-1]
+        sum_squared_norms = v_squared_norm.sum(-1) + s_squared_norm.sum(-1) + p_squared_norm.sum(-1)
+        norm = torch.rsqrt(sum_squared_norms / total_features + self.epsilon)
 
-        vectors_out = vectors * norm.unsqueeze(-1)
-        scalars_out = scalars * norm
-        pseudoscalars_out = pseudoscalars * norm
-        return vectors_out, scalars_out, pseudoscalars_out
+        outputs_v = vectors * norm[..., None, None]
+        outputs_s = scalars * norm[..., None]
+        outputs_p = pseudoscalars * norm[..., None]
+        if self.elementwise_affine:
+            outputs_v = outputs_v * self.weight_v[..., None]
+            outputs_s = outputs_s * self.weight_s
+            outputs_p = outputs_p * self.weight_p
+        return outputs_v, outputs_s, outputs_p
 
 
 class Linear(nn.Module):
-    """Linear operations for vector, scalar, and pseudoscalar features.
+    """Linear layer for vector, scalar, and pseudoscalar features.
 
-    Supports optional mixing between vector and scalar features to improve expressivity.
-    Pseudoscalar outputs receive both a linear pseudoscalar contribution and a parity-odd
-    contribution generated from the vector inputs through ``VectorToPseudoscalar``.
-    Scalar outputs receive an additional parity-even contribution from squared pseudoscalars.
+    The vector and scalar streams are kept separate; pseudoscalars couple back into the other
+    streams in the only parity-consistent ways: a parity-odd vector-to-pseudoscalar contribution
+    feeds the pseudoscalar output (via :class:`VectorToPseudoscalar`), and a parity-even
+    contribution from squared pseudoscalars feeds the scalar output.
+
+    Parameters
+    ----------
+    in_v_channels
+        Number of input vector channels.
+    out_v_channels
+        Number of output vector channels.
+    in_s_channels
+        Number of input scalar channels.
+    out_s_channels
+        Number of output scalar channels.
+    in_p_channels
+        Number of input pseudoscalar channels.
+    out_p_channels
+        Number of output pseudoscalar channels.
+    bias
+        Whether to include a bias term in the scalar linear layer.
+    initialization
+        Initialization scheme for the weights. ``"default"`` or ``"small"`` (smaller weights, used
+        for attention projections to improve stability).
     """
 
     def __init__(
@@ -173,46 +274,17 @@ class Linear(nn.Module):
         out_p_channels: int,
         bias: bool = True,
         initialization: str = "default",
-    ):
-        """
-        Parameters
-        ----------
-        in_v_channels : int
-            Number of input vector channels.
-        out_v_channels : int
-            Number of output vector channels.
-        in_s_channels : int
-            Number of input scalar channels.
-        out_s_channels : int
-            Number of output scalar channels.
-        in_p_channels : int
-            Number of input pseudoscalar channels.
-        out_p_channels : int
-            Number of output pseudoscalar channels.
-        bias : bool, optional
-            Whether to include a bias term in the scalar linear layer, by default True.
-        initialization : str, optional
-            Initialization method for weights, by default "default".
-            The alternative "small" initializes weights to smaller values,
-            which might improve stability in attention projections.
-        """
+    ) -> None:
         super().__init__()
         self._in_v_channels = in_v_channels
         self._out_v_channels = out_v_channels
         self._in_s_channels = in_s_channels
         self._out_s_channels = out_s_channels
-        self._bias = bias
         self._in_p_channels = in_p_channels
         self._out_p_channels = out_p_channels
+        self._bias = bias
 
-        self.weight_v = nn.Parameter(
-            torch.empty(
-                (
-                    out_v_channels,
-                    in_v_channels,
-                )
-            )
-        )
+        self.weight_v = nn.Parameter(torch.empty((out_v_channels, in_v_channels)))
         self.linear_s = nn.Linear(in_s_channels, out_s_channels, bias=bias)
         self.p_to_s = nn.Linear(in_p_channels, out_s_channels, bias=False)
         self.linear_p = nn.Linear(in_p_channels, out_p_channels, bias=False)
@@ -220,28 +292,40 @@ class Linear(nn.Module):
 
         self.reset_parameters(initialization)
 
-    def forward(self, vectors, scalars, pseudoscalars):
-        """
+        # zero-size params get grads only sometimes under compile, breaking DDP
+        if self.weight_v.numel() == 0:
+            self.weight_v.requires_grad_(False)
+
+    def forward(
+        self, vectors: torch.Tensor, scalars: torch.Tensor, pseudoscalars: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply the linear map.
+
         Parameters
         ----------
-        vectors : torch.Tensor
-            A tensor of shape (..., v_channels, 4) representing Lorentz vectors.
-        scalars : torch.Tensor
-            A tensor of shape (..., s_channels) representing scalar features.
-        pseudoscalars : torch.Tensor
-            A tensor of shape (..., p_channels) representing pseudoscalar features.
+        vectors
+            Lorentz vectors of shape ``(..., in_v_channels, 4)``.
+        scalars
+            Scalar features of shape ``(..., in_s_channels)``.
+        pseudoscalars
+            Pseudoscalar features of shape ``(..., in_p_channels)``.
 
         Returns
         -------
-        torch.Tensor, torch.Tensor, torch.Tensor
-            Tensors of the same shape as input representing the transformed vectors, scalars, and pseudoscalars.
+        outputs_v
+            Lorentz vectors of shape ``(..., out_v_channels, 4)``.
+        outputs_s
+            Scalar features of shape ``(..., out_s_channels)``.
+        outputs_p
+            Pseudoscalar features of shape ``(..., out_p_channels)``.
         """
-        vectors_out = self.weight_v @ vectors
-        scalars_out = self.linear_s(scalars) + self.p_to_s(pseudoscalars.pow(2))
-        pseudoscalars_out = self.linear_p(pseudoscalars) + self.vector_to_p(vectors)
-        return vectors_out, scalars_out, pseudoscalars_out
+        outputs_v = nn.functional.linear(vectors.mT, self.weight_v).mT
+        outputs_s = self.linear_s(scalars) + self.p_to_s(pseudoscalars.square())
+        outputs_p = self.linear_p(pseudoscalars) + self.vector_to_p(vectors)
+        return outputs_v, outputs_s, outputs_p
 
-    def reset_parameters(self, initialization, additional_factor=1.0):
+    def reset_parameters(self, initialization: str, additional_factor: float = 1.0) -> None:
+        """Re-initialize the weights with the given scheme."""
         if initialization == "default":
             v_factor = additional_factor
             s_factor = additional_factor
@@ -253,13 +337,16 @@ class Linear(nn.Module):
         else:
             raise ValueError(f"Unknown initialization: {initialization}")
 
-        fan_in = max(self._in_v_channels, 1)
-        bound = v_factor / math.sqrt(fan_in)
-        nn.init.uniform_(self.weight_v, a=-bound, b=bound)
+        if self.weight_v.numel() > 0:
+            fan_in = max(self._in_v_channels, 1)
+            bound = v_factor / math.sqrt(fan_in)
+            nn.init.uniform_(self.weight_v, a=-bound, b=bound)
 
         fan_in = max(self._in_s_channels, 1)
         bound = s_factor / math.sqrt(fan_in)
         nn.init.uniform_(self.linear_s.weight, a=-bound, b=bound)
+        if self.linear_s.bias is not None:
+            nn.init.zeros_(self.linear_s.bias)
 
         fan_in = max(self._in_p_channels, 1)
         bound = p_factor / math.sqrt(fan_in)
@@ -271,8 +358,31 @@ class Linear(nn.Module):
 class GatedLinearUnit(nn.Module):
     """Gated linear unit (GLU) for vector, scalar, and pseudoscalar features.
 
-    Scalar and pseudoscalar gates are computed from scalar features,
-    while vector gates are computed from inner products of vector features.
+    Scalar and pseudoscalar gates are computed from scalar features (parity-even quantities);
+    vector gates are computed from Lorentz inner products of (transformed) vector features. Gating
+    a parity-odd pseudoscalar pre-activation with a parity-even gate keeps the output parity-odd.
+
+    Parameters
+    ----------
+    in_v_channels
+        Number of input vector channels.
+    out_v_channels
+        Number of output vector channels.
+    in_s_channels
+        Number of input scalar channels.
+    out_s_channels
+        Number of output scalar channels.
+    in_p_channels
+        Number of input pseudoscalar channels.
+    out_p_channels
+        Number of output pseudoscalar channels.
+    nonlinearity
+        Nonlinearity for the scalar and pseudoscalar gates (and for the vector gate when
+        ``nonlinearity_v`` is ``None``). One of ``"relu"``, ``"sigmoid"``, ``"tanh"``, ``"gelu"``,
+        ``"silu"``.
+    nonlinearity_v
+        Optional override for the vector-path gate nonlinearity. ``None`` falls back to
+        ``nonlinearity``.
     """
 
     def __init__(
@@ -284,10 +394,11 @@ class GatedLinearUnit(nn.Module):
         in_p_channels: int,
         out_p_channels: int,
         nonlinearity: str = "gelu",
-    ):
+        nonlinearity_v: str | None = "sigmoid",
+    ) -> None:
         super().__init__()
-        self.out_s_channels = out_s_channels
-        self.out_p_channels = out_p_channels
+        self._out_s_channels = out_s_channels
+        self._out_p_channels = out_p_channels
         self.linear = Linear(
             in_v_channels=in_v_channels,
             out_v_channels=3 * out_v_channels,
@@ -297,39 +408,70 @@ class GatedLinearUnit(nn.Module):
             out_p_channels=out_p_channels,
         )
         self.nonlinearity = get_nonlinearity(nonlinearity)
+        self.nonlinearity_v = (
+            get_nonlinearity(nonlinearity_v) if nonlinearity_v is not None else self.nonlinearity
+        )
 
-    def forward(self, vectors, scalars, pseudoscalars):
-        """
+    def forward(
+        self, vectors: torch.Tensor, scalars: torch.Tensor, pseudoscalars: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply the GLU.
+
         Parameters
         ----------
-        vectors : torch.Tensor
-            A tensor of shape (..., v_channels, 4) representing Lorentz vectors.
-        scalars : torch.Tensor
-            A tensor of shape (..., s_channels) representing scalar features.
-        pseudoscalars : torch.Tensor
-            A tensor of shape (..., p_channels) representing pseudoscalar features.
+        vectors
+            Lorentz vectors of shape ``(..., in_v_channels, 4)``.
+        scalars
+            Scalar features of shape ``(..., in_s_channels)``.
+        pseudoscalars
+            Pseudoscalar features of shape ``(..., in_p_channels)``.
 
         Returns
         -------
-        torch.Tensor, torch.Tensor, torch.Tensor
-            Tensors of the same shape as input representing the transformed vectors, scalars, and
-            pseudoscalars.
+        outputs_v
+            Lorentz vectors of shape ``(..., out_v_channels, 4)``.
+        outputs_s
+            Scalar features of shape ``(..., out_s_channels)``.
+        outputs_p
+            Pseudoscalar features of shape ``(..., out_p_channels)``.
         """
         v_full, s_full, p_pre = self.linear(vectors, scalars, pseudoscalars)
         v_pre, v_gates_1, v_gates_2 = v_full.chunk(3, dim=-2)
-        s_pre = s_full[..., : self.out_s_channels]
-        s_gates = s_full[..., self.out_s_channels : 2 * self.out_s_channels]
-        p_gates = s_full[..., 2 * self.out_s_channels :]
+        s_pre = s_full[..., : self._out_s_channels]
+        s_gates = s_full[..., self._out_s_channels : 2 * self._out_s_channels]
+        p_gates = s_full[..., 2 * self._out_s_channels :]
 
-        v_gates = inner_product(v_gates_1, v_gates_2).unsqueeze(-1)
-        vectors_out = self.nonlinearity(v_gates) * v_pre
-        scalars_out = self.nonlinearity(s_gates) * s_pre
-        pseudoscalars_out = self.nonlinearity(p_gates) * p_pre
-        return vectors_out, scalars_out, pseudoscalars_out
+        v_gates = self._get_inner_product(v_gates_1, v_gates_2)
+
+        outputs_v = self.nonlinearity_v(v_gates) * v_pre
+        outputs_s = self.nonlinearity(s_gates) * s_pre
+        outputs_p = self.nonlinearity(p_gates) * p_pre
+        return outputs_v, outputs_s, outputs_p
+
+    @minimum_autocast_precision(torch.float32)
+    def _get_inner_product(self, v_gates_1: torch.Tensor, v_gates_2: torch.Tensor) -> torch.Tensor:
+        # 0.5 = 1/sqrt(4) controls the scale, like 1/sqrt(d_k) in attention
+        return 0.5 * inner_product(v_gates_1, v_gates_2).unsqueeze(-1)
 
 
 class SelfAttention(nn.Module):
-    """Self-attention module for Lorentz vectors, scalars, and pseudoscalars."""
+    """Self-attention for Lorentz vectors, scalars, and pseudoscalars.
+
+    Parameters
+    ----------
+    v_channels
+        Number of vector channels.
+    s_channels
+        Number of scalar channels.
+    p_channels
+        Number of pseudoscalar channels.
+    num_heads
+        Number of attention heads.
+    attn_ratio
+        Expansion ratio for the attention hidden channels.
+    dropout_prob
+        Dropout probability.
+    """
 
     def __init__(
         self,
@@ -339,15 +481,14 @@ class SelfAttention(nn.Module):
         num_heads: int,
         attn_ratio: int = 1,
         dropout_prob: float | None = None,
-    ):
+    ) -> None:
         super().__init__()
         self.hidden_v_channels = max(attn_ratio * v_channels // num_heads, 1)
         self.hidden_s_channels = max(attn_ratio * s_channels // num_heads, 4)
         self.hidden_p_channels = max(attn_ratio * p_channels // num_heads, 1)
         self.num_heads = num_heads
 
-        metric = torch.tensor([1.0, -1.0, -1.0, -1.0])
-        self.register_buffer("metric", metric)
+        self.register_buffer("metric", torch.tensor([1.0, -1.0, -1.0, -1.0]), persistent=False)
 
         self.linear_in = Linear(
             in_v_channels=v_channels,
@@ -356,6 +497,7 @@ class SelfAttention(nn.Module):
             out_s_channels=3 * self.hidden_s_channels * self.num_heads,
             in_p_channels=p_channels,
             out_p_channels=3 * self.hidden_p_channels * self.num_heads,
+            bias=False,
             initialization="small",
         )
         self.linear_out = Linear(
@@ -367,13 +509,20 @@ class SelfAttention(nn.Module):
             out_p_channels=p_channels,
             initialization="small",
         )
-        self.norm = RMSNorm()
+        self.norm = RMSNorm(
+            self.hidden_v_channels,
+            self.hidden_s_channels,
+            self.hidden_p_channels,
+            elementwise_affine=False,
+        )
         if dropout_prob is not None:
             self.dropout = Dropout(dropout_prob)
         else:
             self.dropout = None
 
-    def _pre_reshape(self, qkv_v, qkv_s, qkv_p):
+    def _pre_attention_reshape(
+        self, qkv_v: torch.Tensor, qkv_s: torch.Tensor, qkv_p: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         qkv_v = (
             qkv_v.unflatten(-2, (3, self.hidden_v_channels, self.num_heads))
             .movedim(-4, 0)
@@ -390,65 +539,85 @@ class SelfAttention(nn.Module):
             .movedim(-1, -3)
         )
 
-        # normalize for stability (important)
+        # norm QK to avoid attention logit blowup (standard in LLMs)
+        # we find that normalizing V as well helps with stability+performance
         qkv_v, qkv_s, qkv_p = self.norm(qkv_v, qkv_s, qkv_p)
-
         q_v, k_v, v_v = qkv_v.unbind(0)
         q_s, k_s, v_s = qkv_s.unbind(0)
         q_p, k_p, v_p = qkv_p.unbind(0)
 
-        q_v_mod = q_v * self.metric
-        q = torch.cat([q_v_mod.flatten(start_dim=-2), q_s, q_p], dim=-1)
+        q_v = q_v * self.metric.to(q_v.dtype)
+
+        q = torch.cat([q_v.flatten(start_dim=-2), q_s, q_p], dim=-1)
         k = torch.cat([k_v.flatten(start_dim=-2), k_s, k_p], dim=-1)
         v = torch.cat([v_v.flatten(start_dim=-2), v_s, v_p], dim=-1)
         return q, k, v
 
-    def _post_reshape(self, out):
-        v_end = self.hidden_v_channels * 4
-        s_end = v_end + self.hidden_s_channels
-        h_v = out[..., :v_end].reshape(*out.shape[:-1], self.hidden_v_channels, 4)
-        h_s = out[..., v_end:s_end]
-        h_p = out[..., s_end:]
+    def forward(
+        self,
+        vectors: torch.Tensor,
+        scalars: torch.Tensor,
+        pseudoscalars: torch.Tensor,
+        **attn_kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply self-attention.
 
-        h_v = h_v.movedim(-3, -4).flatten(-3, -2)
-        h_s = h_s.movedim(-2, -3).flatten(-2, -1)
-        h_p = h_p.movedim(-2, -3).flatten(-2, -1)
-        return h_v, h_s, h_p
-
-    def forward(self, vectors, scalars, pseudoscalars, **attn_kwargs):
-        """
         Parameters
         ----------
-        vectors : torch.Tensor
-            A tensor of shape (..., v_channels, 4) representing Lorentz vectors.
-        scalars : torch.Tensor
-            A tensor of shape (..., s_channels) representing scalar features.
-        pseudoscalars : torch.Tensor
-            A tensor of shape (..., p_channels) representing pseudoscalar features.
-        **attn_kwargs : dict
-            Additional keyword arguments for the attention function.
+        vectors
+            Lorentz vectors of shape ``(..., items, v_channels, 4)``.
+        scalars
+            Scalar features of shape ``(..., items, s_channels)``.
+        pseudoscalars
+            Pseudoscalar features of shape ``(..., items, p_channels)``.
+        **attn_kwargs
+            Optional keyword arguments forwarded to attention.
 
         Returns
         -------
-        torch.Tensor, torch.Tensor, torch.Tensor
-            Tensors of the same shape as input representing the transformed vectors, scalars, and
-            pseudoscalars.
+        outputs_v
+            Lorentz vectors of shape ``(..., items, v_channels, 4)``.
+        outputs_s
+            Scalar features of shape ``(..., items, s_channels)``.
+        outputs_p
+            Pseudoscalar features of shape ``(..., items, p_channels)``.
         """
         qkv_v, qkv_s, qkv_p = self.linear_in(vectors, scalars, pseudoscalars)
 
-        q, k, v = self._pre_reshape(qkv_v, qkv_s, qkv_p)
-        out = scaled_dot_product_attention(q, k, v, **attn_kwargs)
-        h_v, h_s, h_p = self._post_reshape(out)
+        q, k, v = self._pre_attention_reshape(qkv_v, qkv_s, qkv_p)
+        out = _call_attention(q, k, v, **attn_kwargs)
+        h_v, h_s, h_p = _post_attention_reshape(out, self.hidden_v_channels, self.hidden_s_channels)
 
-        out_v, out_s, out_p = self.linear_out(h_v, h_s, h_p)
+        outputs_v, outputs_s, outputs_p = self.linear_out(h_v, h_s, h_p)
 
         if self.dropout is not None:
-            out_v, out_s, out_p = self.dropout(out_v, out_s, out_p)
-        return out_v, out_s, out_p
+            outputs_v, outputs_s, outputs_p = self.dropout(outputs_v, outputs_s, outputs_p)
+        return outputs_v, outputs_s, outputs_p
 
 
 class MLP(nn.Module):
-    """Multi-layer perceptron (MLP) for vector, scalar, and pseudoscalar features."""
+    """Multi-layer perceptron for vector, scalar, and pseudoscalar features.
+
+    Parameters
+    ----------
+    v_channels
+        Number of vector channels.
+    s_channels
+        Number of scalar channels.
+    p_channels
+        Number of pseudoscalar channels.
+    nonlinearity
+        Nonlinearity for the GLU layers (scalar/pseudoscalar gates, and vector gate when
+        ``nonlinearity_v`` is ``None``).
+    nonlinearity_v
+        Optional override for the vector-path gate nonlinearity in each GLU.
+    mlp_ratio
+        Expansion ratio for hidden channels.
+    num_layers
+        Total number of layers (must be ``>= 2``).
+    dropout_prob
+        Dropout probability.
+    """
 
     def __init__(
         self,
@@ -456,13 +625,14 @@ class MLP(nn.Module):
         s_channels: int,
         p_channels: int,
         nonlinearity: str = "gelu",
+        nonlinearity_v: str | None = "sigmoid",
         mlp_ratio: int = 2,
         num_layers: int = 2,
         dropout_prob: float | None = None,
-    ):
+    ) -> None:
         super().__init__()
         assert num_layers >= 2
-        layers = []
+        layers: list[nn.Module] = []
 
         v_channels_list = [v_channels] + [mlp_ratio * v_channels] * (num_layers - 1) + [v_channels]
         s_channels_list = [s_channels] + [mlp_ratio * s_channels] * (num_layers - 1) + [s_channels]
@@ -478,6 +648,7 @@ class MLP(nn.Module):
                     in_p_channels=p_channels_list[i],
                     out_p_channels=p_channels_list[i + 1],
                     nonlinearity=nonlinearity,
+                    nonlinearity_v=nonlinearity_v,
                 )
             )
             if dropout_prob is not None:
@@ -495,34 +666,67 @@ class MLP(nn.Module):
 
         self.layers = nn.ModuleList(layers)
 
-    def forward(self, vectors, scalars, pseudoscalars):
-        """
+    def forward(
+        self, vectors: torch.Tensor, scalars: torch.Tensor, pseudoscalars: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass.
+
         Parameters
         ----------
-        vectors : torch.Tensor
-            A tensor of shape (..., v_channels, 4) representing Lorentz vectors.
-        scalars : torch.Tensor
-            A tensor of shape (..., s_channels) representing scalar features.
-        pseudoscalars : torch.Tensor
-            A tensor of shape (..., p_channels) representing pseudoscalar features.
+        vectors
+            Lorentz vectors of shape ``(..., v_channels, 4)``.
+        scalars
+            Scalar features of shape ``(..., s_channels)``.
+        pseudoscalars
+            Pseudoscalar features of shape ``(..., p_channels)``.
 
         Returns
         -------
-        torch.Tensor, torch.Tensor, torch.Tensor
-            Tensors of the same shape as input representing the normalized vectors, scalars, and
-            pseudoscalars.
+        outputs_v
+            Lorentz vectors of shape ``(..., v_channels, 4)``.
+        outputs_s
+            Scalar features of shape ``(..., s_channels)``.
+        outputs_p
+            Pseudoscalar features of shape ``(..., p_channels)``.
         """
-        v, s, p = vectors, scalars, pseudoscalars
+        h_v, h_s, h_p = vectors, scalars, pseudoscalars
 
         for layer in self.layers:
-            v, s, p = layer(v, scalars=s, pseudoscalars=p)
+            h_v, h_s, h_p = layer(h_v, scalars=h_s, pseudoscalars=h_p)
 
-        return v, s, p
+        return h_v, h_s, h_p
 
 
 class LGATrSlimPseudoBlock(nn.Module):
-    """A single block of the pseudoscalar-extended L-GATr-slim,
-    consisting of self-attention and MLP layers, pre-norm and residual connections."""
+    """A single block of the pseudoscalar-extended L-GATr-slim network.
+
+    Pre-norm + self-attention + residual, then pre-norm + MLP + residual.
+
+    Parameters
+    ----------
+    v_channels
+        Number of vector channels.
+    s_channels
+        Number of scalar channels.
+    p_channels
+        Number of pseudoscalar channels.
+    num_heads
+        Number of attention heads.
+    nonlinearity
+        Nonlinearity for the MLP layers.
+    nonlinearity_v
+        Optional override for the vector-path gate nonlinearity in the MLP's GLUs.
+    mlp_ratio
+        Expansion ratio for MLP hidden channels.
+    attn_ratio
+        Expansion ratio for attention hidden channels.
+    num_layers_mlp
+        Number of layers in the MLP.
+    dropout_prob
+        Dropout probability.
+    norm_elementwise_affine
+        Whether the pre-norms use a learnable per-channel gain.
+    """
 
     def __init__(
         self,
@@ -531,14 +735,21 @@ class LGATrSlimPseudoBlock(nn.Module):
         p_channels: int,
         num_heads: int,
         nonlinearity: str = "gelu",
+        nonlinearity_v: str | None = "sigmoid",
         mlp_ratio: int = 2,
         attn_ratio: int = 1,
         num_layers_mlp: int = 2,
         dropout_prob: float | None = None,
-    ):
+        norm_elementwise_affine: bool = True,
+    ) -> None:
         super().__init__()
 
-        self.norm = RMSNorm()
+        self.norm1 = RMSNorm(
+            v_channels, s_channels, p_channels, elementwise_affine=norm_elementwise_affine
+        )
+        self.norm2 = RMSNorm(
+            v_channels, s_channels, p_channels, elementwise_affine=norm_elementwise_affine
+        )
 
         self.attention = SelfAttention(
             v_channels=v_channels,
@@ -554,44 +765,50 @@ class LGATrSlimPseudoBlock(nn.Module):
             s_channels=s_channels,
             p_channels=p_channels,
             nonlinearity=nonlinearity,
+            nonlinearity_v=nonlinearity_v,
             mlp_ratio=mlp_ratio,
             num_layers=num_layers_mlp,
             dropout_prob=dropout_prob,
         )
 
-    def forward(self, vectors, scalars, pseudoscalars, **attn_kwargs):
-        """
+    def forward(
+        self,
+        vectors: torch.Tensor,
+        scalars: torch.Tensor,
+        pseudoscalars: torch.Tensor,
+        **attn_kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass.
+
         Parameters
         ----------
-        vectors : torch.Tensor
-            A tensor of shape (..., v_channels, 4) representing Lorentz vectors.
-        scalars : torch.Tensor
-            A tensor of shape (..., s_channels) representing scalar features.
-        pseudoscalars : torch.Tensor
-            A tensor of shape (..., p_channels) representing pseudoscalar features.
-        **attn_kwargs : dict
-            Additional keyword arguments for the attention function.
+        vectors
+            Lorentz vectors of shape ``(..., items, v_channels, 4)``.
+        scalars
+            Scalar features of shape ``(..., items, s_channels)``.
+        pseudoscalars
+            Pseudoscalar features of shape ``(..., items, p_channels)``.
+        **attn_kwargs
+            Optional keyword arguments forwarded to attention.
 
         Returns
         -------
-        torch.Tensor, torch.Tensor, torch.Tensor
-            Tensors of the same shape as input representing the normalized vectors, scalars, and
-            pseudoscalars.
+        outputs_v
+            Lorentz vectors of shape ``(..., items, v_channels, 4)``.
+        outputs_s
+            Scalar features of shape ``(..., items, s_channels)``.
+        outputs_p
+            Pseudoscalar features of shape ``(..., items, p_channels)``.
         """
-        h_v, h_s, h_p = self.norm(vectors, scalars, pseudoscalars)
+        h_v, h_s, h_p = self.norm1(vectors, scalars, pseudoscalars)
 
-        h_v, h_s, h_p = self.attention(
-            h_v,
-            h_s,
-            h_p,
-            **attn_kwargs,
-        )
+        h_v, h_s, h_p = self.attention(h_v, h_s, h_p, **attn_kwargs)
 
         outputs_v = vectors + h_v
         outputs_s = scalars + h_s
         outputs_p = pseudoscalars + h_p
 
-        h_v, h_s, h_p = self.norm(outputs_v, outputs_s, outputs_p)
+        h_v, h_s, h_p = self.norm2(outputs_v, outputs_s, outputs_p)
 
         h_v, h_s, h_p = self.mlp(h_v, h_s, h_p)
 
@@ -603,7 +820,61 @@ class LGATrSlimPseudoBlock(nn.Module):
 
 
 class LGATrSlimPseudo(nn.Module):
-    """L-GATr-slim network with an additional pseudoscalar stream."""
+    """L-GATr-slim network with an additional pseudoscalar stream.
+
+    A slimmer L-GATr variant that operates on Lorentz vectors, scalars, and pseudoscalars (no full
+    multivector representation). Stacks ``num_blocks`` :class:`LGATrSlimPseudoBlock` modules between
+    initial and final :class:`Linear` layers. Usually instantiated indirectly via
+    :class:`LGATrSlim` with nonzero pseudoscalar channels.
+
+    Parameters
+    ----------
+    in_v_channels
+        Number of input vector channels.
+    out_v_channels
+        Number of output vector channels.
+    hidden_v_channels
+        Number of hidden vector channels.
+    in_s_channels
+        Number of input scalar channels.
+    out_s_channels
+        Number of output scalar channels.
+    hidden_s_channels
+        Number of hidden scalar channels.
+    in_p_channels
+        Number of input pseudoscalar channels.
+    out_p_channels
+        Number of output pseudoscalar channels.
+    hidden_p_channels
+        Number of hidden pseudoscalar channels.
+    num_blocks
+        Number of Lorentz-transformer blocks.
+    num_heads
+        Number of attention heads.
+    nonlinearity
+        Nonlinearity for the MLP layers.
+    nonlinearity_v
+        Optional override for the vector-path gate nonlinearity in every GLU. ``None`` falls
+        back to ``nonlinearity``.
+    mlp_ratio
+        Expansion ratio for MLP hidden channels.
+    attn_ratio
+        Expansion ratio for attention hidden channels.
+    num_layers_mlp
+        Number of layers in each MLP.
+    dropout_prob
+        Dropout probability.
+    norm_elementwise_affine
+        Whether the block pre-norms use a learnable per-channel gain.
+    checkpoint_blocks
+        Whether to use gradient checkpointing for the blocks.
+    compile
+        Whether to wrap the model with :func:`torch.compile`.
+    **compile_kwargs
+        Forwarded to :func:`lgatr.utils.compile.compile_model` when ``compile=True``;
+        see there for the supported keys (``compile_mode``, ``compile_dynamic``,
+        ``compile_fullgraph``) and their defaults.
+    """
 
     def __init__(
         self,
@@ -619,54 +890,18 @@ class LGATrSlimPseudo(nn.Module):
         num_blocks: int,
         num_heads: int,
         nonlinearity: str = "gelu",
+        nonlinearity_v: str | None = "sigmoid",
         mlp_ratio: int = 2,
         attn_ratio: int = 1,
         num_layers_mlp: int = 2,
         dropout_prob: float | None = None,
+        norm_elementwise_affine: bool = True,
         checkpoint_blocks: bool = False,
         compile: bool = False,
-    ):
-        """
-        Parameters
-        ----------
-        in_v_channels : int
-            Number of input vector channels.
-        out_v_channels : int
-            Number of output vector channels.
-        hidden_v_channels : int
-            Number of hidden vector channels.
-        in_s_channels : int
-            Number of input scalar channels.
-        out_s_channels : int
-            Number of output scalar channels.
-        hidden_s_channels : int
-            Number of hidden scalar channels.
-        in_p_channels : int
-            Number of input pseudoscalar channels.
-        out_p_channels : int
-            Number of output pseudoscalar channels.
-        hidden_p_channels : int
-            Number of hidden pseudoscalar channels.
-        num_blocks : int
-            Number of Lorentz Transformer blocks.
-        num_heads : int
-            Number of attention heads.
-        nonlinearity : str, optional
-            Nonlinearity type for MLP layers, by default "gelu".
-        mlp_ratio : int, optional
-            Expansion ratio for MLP hidden layers, by default 2.
-        attn_ratio : int, optional
-            Expansion ratio for attention hidden layers, by default 1.
-        num_layers_mlp : int, optional
-            Number of layers in MLP, by default 2.
-        dropout_prob : float | None, optional
-            Dropout probability, by default None.
-        checkpoint_blocks : bool, optional
-            Whether to use gradient checkpointing for blocks, by default False.
-        compile : bool, optional
-            Whether to compile the model with torch.compile, by default False.
-        """
+        **compile_kwargs,
+    ) -> None:
         super().__init__()
+        self._in_p_channels = in_p_channels
 
         self.linear_in = Linear(
             in_v_channels=in_v_channels,
@@ -685,10 +920,12 @@ class LGATrSlimPseudo(nn.Module):
                     p_channels=hidden_p_channels,
                     num_heads=num_heads,
                     nonlinearity=nonlinearity,
+                    nonlinearity_v=nonlinearity_v,
                     mlp_ratio=mlp_ratio,
                     attn_ratio=attn_ratio,
                     num_layers_mlp=num_layers_mlp,
                     dropout_prob=dropout_prob,
+                    norm_elementwise_affine=norm_elementwise_affine,
                 )
                 for _ in range(num_blocks)
             ]
@@ -704,53 +941,50 @@ class LGATrSlimPseudo(nn.Module):
         )
         self._checkpoint_blocks = checkpoint_blocks
 
-        self.compile = compile
         if compile:
-            # ugly hack to make torch.compile convenient for users
-            # the clean solution is model = torch.compile(model, **kwargs) outside of the constructor
-            # note that we need fullgraph=False because of the torch.compiler.disable for attention
-            self.__class__ = torch.compile(self.__class__, dynamic=True, mode="default")
+            compile_model(self, **compile_kwargs)
 
-    def forward(self, vectors, scalars, pseudoscalars=None, **attn_kwargs):
-        """
+    def forward(
+        self,
+        vectors: torch.Tensor,
+        scalars: torch.Tensor,
+        pseudoscalars: torch.Tensor | None = None,
+        **attn_kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass.
+
         Parameters
         ----------
-        vectors : torch.Tensor
-            A tensor of shape (..., v_channels, 4) representing Lorentz vectors.
-        scalars : torch.Tensor
-            A tensor of shape (..., s_channels) representing scalar features.
-        pseudoscalars : torch.Tensor, optional
-            A tensor of shape (..., p_channels) representing pseudoscalar features.
-        **attn_kwargs : dict
-            Additional keyword arguments for the attention function.
+        vectors
+            Lorentz vectors of shape ``(..., items, in_v_channels, 4)``.
+        scalars
+            Scalar features of shape ``(..., items, in_s_channels)``.
+        pseudoscalars
+            Pseudoscalar features of shape ``(..., items, in_p_channels)``. May be ``None`` only
+            when the model expects no input pseudoscalar channels.
+        **attn_kwargs
+            Optional keyword arguments forwarded to attention.
 
         Returns
         -------
-        torch.Tensor, torch.Tensor, torch.Tensor
-            Tensors of the same shape as input representing the normalized vectors, scalars and pseudoscalars.
+        outputs_v
+            Lorentz vectors of shape ``(..., items, out_v_channels, 4)``.
+        outputs_s
+            Scalar features of shape ``(..., items, out_s_channels)``.
+        outputs_p
+            Pseudoscalar features of shape ``(..., items, out_p_channels)``.
         """
-
-        if pseudoscalars is None and self.linear_in._in_p_channels == 0:
-            pseudoscalars = torch.empty(
-                scalars.shape[:-1] + (0,), device=scalars.device, dtype=scalars.dtype
-            )
-        else:
-            assert pseudoscalars is not None, (
+        if pseudoscalars is None:
+            assert self._in_p_channels == 0, (
                 "Pseudoscalar input cannot be None if the model expects pseudoscalar channels."
             )
+            pseudoscalars = scalars.new_zeros(*scalars.shape[:-1], 0)
 
         h_v, h_s, h_p = self.linear_in(vectors, scalars, pseudoscalars)
 
         for block in self.blocks:
             if self._checkpoint_blocks:
-                h_v, h_s, h_p = checkpoint(
-                    block,
-                    h_v,
-                    h_s,
-                    h_p,
-                    use_reentrant=False,
-                    **attn_kwargs,
-                )
+                h_v, h_s, h_p = checkpoint(block, h_v, h_s, h_p, use_reentrant=False, **attn_kwargs)
             else:
                 h_v, h_s, h_p = block(h_v, h_s, h_p, **attn_kwargs)
 
