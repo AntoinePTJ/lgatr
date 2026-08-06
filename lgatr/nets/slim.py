@@ -51,6 +51,9 @@ class LGATrSlim(nn.Module):
         Dropout probability.
     norm_elementwise_affine
         Whether the block :class:`SlimRMSNorm` instances learn a per-channel gain.
+    mix_v2s
+        Whether every block injects Minkowski invariants of its vector stream into its scalar
+        stream (:class:`SlimVectorToScalar`).
     checkpoint_blocks
         Whether to use gradient checkpointing for the blocks.
     naive_amp
@@ -89,6 +92,7 @@ class LGATrSlim(nn.Module):
         num_layers_mlp: int = 2,
         dropout_prob: float | None = None,
         norm_elementwise_affine: bool = True,
+        mix_v2s: bool = False,
         checkpoint_blocks: bool = False,
         naive_amp: bool = False,
         compile: bool = False,
@@ -118,6 +122,7 @@ class LGATrSlim(nn.Module):
                     num_layers_mlp=num_layers_mlp,
                     dropout_prob=dropout_prob,
                     norm_elementwise_affine=norm_elementwise_affine,
+                    mix_v2s=mix_v2s,
                 )
                 for _ in range(num_blocks)
             ]

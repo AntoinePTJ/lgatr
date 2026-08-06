@@ -170,3 +170,28 @@ def check_equivariance(
         invariant=False,
         **tolerances,
     )
+
+
+def check_invariance(
+    function: Callable,
+    fn_kwargs: dict | None = None,
+    batch_dims: tuple | list = (1,),
+    num_args: int = 1,
+    num_checks: int = 2,
+    vector_dim: int = -1,
+    **tolerances,
+) -> None:
+    """Check whether a callable is SO(1, 3)-invariant on Lorentz-vector inputs.
+
+    Takes the same arguments as :func:`check_equivariance`, but compares the outputs of the
+    transformed inputs against the untransformed outputs.
+    """
+    _check(
+        function,
+        [RandomLorentzTransform(vector_dim) for _ in range(num_checks)],
+        num_args,
+        batch_dims,
+        fn_kwargs,
+        invariant=True,
+        **tolerances,
+    )

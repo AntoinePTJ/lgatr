@@ -10,9 +10,17 @@ from lgatr.layers.slim_layers import (
     SlimRMSNorm,
     SlimSelfAttention,
     SlimVecLinear,
+    SlimVectorToScalar,
 )
 from lgatr.nets.slim import LGATrSlim
-from tests.helpers import BATCH_DIMS, TOLERANCES, check_equivariance
+from tests.helpers import (
+    BATCH_DIMS,
+    STRICT_TOLERANCES,
+    TOLERANCES,
+    check_equivariance,
+    check_invariance,
+)
+
 
 # (in_v, out_v, in_s, out_s), covering the zero-channel edges on every slot.
 CHANNELS = [
@@ -33,6 +41,27 @@ GLU_CASES += [
 ]
 
 LINEAR_CASES = [(*channels, "default") for channels in CHANNELS] + [(*CHANNELS[0], "small")]
+
+
+# The vector<->scalar coupling options, as kwargs for LGATrSlim. Each entry is one ablation arm.
+COUPLINGS = {
+    "none": {},
+    "v2s": dict(mix_v2s=True),
+}
+
+
+def _activate_couplings(net: torch.nn.Module) -> None:
+    """Undo the zero-initialization of the coupling modules, so tests are not vacuous."""
+    generator = torch.Generator().manual_seed(0)
+    with torch.no_grad():
+        for module in net.modules():
+            if isinstance(module, SlimVectorToScalar):
+                output = module.linear_s
+            else:
+                continue
+            for param in output.parameters():
+                param.copy_(torch.randn(param.shape, generator=generator))
+
 
 
 @pytest.mark.parametrize("dropout_prob", [0.1, 0.5])
@@ -317,3 +346,94 @@ def test_SlimVecLinear_equivariance(in_v_channels: int, out_v_channels: int) -> 
     check_equivariance(
         layer, batch_dims=(*BATCH_DIMS[:-1], in_v_channels), vector_dim=-2, **TOLERANCES
     )
+
+
+@pytest.mark.parametrize("n_proj", [1, 4])
+@pytest.mark.parametrize("v_channels,s_channels", [(4, 16), (2, 4)])
+def test_SlimVectorToScalar_invariance(v_channels: int, s_channels: int, n_proj: int) -> None:
+    layer = SlimVectorToScalar(v_channels, s_channels, n_proj=n_proj, zero_init=False)
+
+    v = torch.randn(*BATCH_DIMS[:-1], 4, v_channels)
+    assert layer(v).shape == (*BATCH_DIMS[:-1], s_channels)
+
+    check_invariance(layer, batch_dims=(*BATCH_DIMS[:-1], v_channels), vector_dim=-2, **TOLERANCES)
+
+
+@pytest.mark.parametrize("coupling", list(COUPLINGS))
+@pytest.mark.parametrize("num_blocks", [1, 2])
+def test_LGATrSlim_coupling_equivariance(coupling: str, num_blocks: int) -> None:
+    in_v_channels, in_s_channels = 1, 8
+    layer = LGATrSlim(
+        in_v_channels=in_v_channels,
+        out_v_channels=2,
+        hidden_v_channels=4,
+        in_s_channels=in_s_channels,
+        out_s_channels=3,
+        hidden_s_channels=16,
+        num_blocks=num_blocks,
+        num_heads=2,
+        mlp_ratio=1,
+        **COUPLINGS[coupling],
+    )
+    _activate_couplings(layer)
+    layer.eval()
+    s = torch.randn(*BATCH_DIMS, in_s_channels)
+
+    check_equivariance(
+        layer, batch_dims=(*BATCH_DIMS, in_v_channels), fn_kwargs=dict(scalars=s), **TOLERANCES
+    )
+    check_invariance(
+        lambda v, scalars: layer(v, scalars)[1],
+        batch_dims=(*BATCH_DIMS, in_v_channels),
+        fn_kwargs=dict(scalars=s),
+        **TOLERANCES,
+    )
+
+
+@pytest.mark.parametrize("coupling", [c for c in COUPLINGS if c != "none"])
+def test_LGATrSlim_coupling_zero_init_is_a_noop(coupling: str) -> None:
+    kwargs = dict(
+        in_v_channels=1,
+        out_v_channels=2,
+        hidden_v_channels=4,
+        in_s_channels=8,
+        out_s_channels=3,
+        hidden_s_channels=16,
+        num_blocks=2,
+        num_heads=2,
+        mlp_ratio=1,
+    )
+    baseline = LGATrSlim(**kwargs).eval()
+    coupled = LGATrSlim(**kwargs, **COUPLINGS[coupling]).eval()
+
+    # the coupling modules draw from the RNG, so seeding is not enough to align the two networks
+    missing, unexpected = coupled.load_state_dict(baseline.state_dict(), strict=False)
+    assert not unexpected
+    assert missing and all(".v2s." in key for key in missing)
+
+    v = torch.randn(*BATCH_DIMS, 1, 4)
+    s = torch.randn(*BATCH_DIMS, 8)
+    for expected, actual in zip(baseline(v, s), coupled(v, s), strict=True):
+        torch.testing.assert_close(actual, expected, **STRICT_TOLERANCES)
+
+
+@pytest.mark.parametrize("coupling", [c for c in COUPLINGS if c != "none"])
+def test_LGATrSlim_coupling_flags_reach_the_model(coupling: str) -> None:
+    kwargs = dict(
+        in_v_channels=1,
+        out_v_channels=2,
+        hidden_v_channels=4,
+        in_s_channels=8,
+        out_s_channels=3,
+        hidden_s_channels=16,
+        num_blocks=1,
+        num_heads=2,
+        mlp_ratio=1,
+    )
+    baseline = LGATrSlim(**kwargs)
+    coupled = LGATrSlim(**kwargs, **COUPLINGS[coupling])
+
+    def signature(net):
+        return {key: tuple(value.shape) for key, value in net.state_dict().items()}
+
+    assert signature(coupled) != signature(baseline), f"{coupling} did not change the model"

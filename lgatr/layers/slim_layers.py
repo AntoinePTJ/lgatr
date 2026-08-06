@@ -324,6 +324,82 @@ class SlimVecLinear(nn.Module):
         return nn.functional.linear(vectors, self.weight_v)
 
 
+class SlimVectorToScalar(nn.Module):
+    """Vector-to-scalar coupling: Minkowski invariants injected into the scalar stream.
+
+    The vector stream is projected to ``n_proj`` channels, the Gram matrix of Minkowski inner
+    products of those channels is formed, and its upper triangle (``n_proj(n_proj+1)/2``
+    invariants) is mapped to the scalar channels.
+
+    Parameters
+    ----------
+    v_channels
+        Number of input vector channels.
+    s_channels
+        Number of output scalar channels.
+    n_proj
+        Number of projected vector channels entering the Gram matrix.
+    nonlinearity
+        Nonlinearity applied to the invariants before the scalar map.
+    normalize
+        Whether to divide the projected vectors by their RMS Minkowski norm before forming the
+        Gram matrix.
+    epsilon
+        Numerical offset for ``normalize``.
+    zero_init
+        Whether to zero-initialize the output map.
+    """
+
+    def __init__(
+        self,
+        v_channels: int,
+        s_channels: int,
+        n_proj: int = 4,
+        nonlinearity: str = "gelu",
+        normalize: bool = True,
+        epsilon: float = 0.01,
+        zero_init: bool = True,
+    ) -> None:
+        super().__init__()
+        self.proj = SlimVecLinear(v_channels, n_proj)
+        self.normalize = normalize
+        self.epsilon = epsilon
+        self.register_buffer("metric", torch.tensor([1.0, -1.0, -1.0, -1.0]), persistent=False)
+        indices = torch.triu_indices(n_proj, n_proj)
+        self.register_buffer("triu_row", indices[0], persistent=False)
+        self.register_buffer("triu_col", indices[1], persistent=False)
+        self.nonlinearity = get_nonlinearity(nonlinearity)
+        self.linear_s = nn.Linear(n_proj * (n_proj + 1) // 2, s_channels)
+        if zero_init:
+            nn.init.zeros_(self.linear_s.weight)
+            nn.init.zeros_(self.linear_s.bias)
+
+    @minimum_autocast_precision(torch.float32, output="high")
+    def forward(self, vectors: torch.Tensor) -> torch.Tensor:
+        """Extract invariants from the vector stream.
+
+        Parameters
+        ----------
+        vectors
+            Lorentz vectors of shape ``(..., 4, v_channels)``.
+
+        Returns
+        -------
+        outputs_s
+            Scalar features of shape ``(..., s_channels)``.
+        """
+        projected = self.proj(vectors)
+        if self.normalize:
+            squared_norm = (projected.square() * self.metric[..., None]).sum(-2).abs()
+            mean_squared_norm = squared_norm.mean(-1)
+            projected = projected * torch.rsqrt(mean_squared_norm + self.epsilon)[..., None, None]
+        gram = 0.5 * torch.einsum(
+            "...xa,...xb->...ab", projected * self.metric[..., None], projected
+        )
+        invariants = gram[..., self.triu_row, self.triu_col]
+        return self.linear_s(self.nonlinearity(invariants))
+
+
 class SlimGLU(nn.Module):
     """Gated linear unit (GLU) for vector and scalar features.
 
@@ -640,6 +716,9 @@ class SlimBlock(nn.Module):
         Dropout probability.
     norm_elementwise_affine
         Whether the RMS norms learn a per-channel gain.
+    mix_v2s
+        Whether to inject invariants of the vector stream into the scalar stream with
+        :class:`SlimVectorToScalar`. The invariants are added after the attention residual.
     """
 
     def __init__(
@@ -654,11 +733,18 @@ class SlimBlock(nn.Module):
         num_layers_mlp: int = 2,
         dropout_prob: float | None = None,
         norm_elementwise_affine: bool = True,
+        mix_v2s: bool = False,
     ) -> None:
         super().__init__()
 
         self.norm1 = SlimRMSNorm(v_channels, s_channels, elementwise_affine=norm_elementwise_affine)
         self.norm2 = SlimRMSNorm(v_channels, s_channels, elementwise_affine=norm_elementwise_affine)
+
+        self.v2s = (
+            SlimVectorToScalar(v_channels, s_channels, nonlinearity=nonlinearity)
+            if mix_v2s
+            else None
+        )
 
         self.attention = SlimSelfAttention(
             v_channels=v_channels,
@@ -709,6 +795,9 @@ class SlimBlock(nn.Module):
 
         outputs_v = vectors + h_v
         outputs_s = scalars + h_s
+
+        if self.v2s is not None:
+            outputs_s = outputs_s + self.v2s(outputs_v)
 
         h_v, h_s = self.norm2(outputs_v, outputs_s)
 
