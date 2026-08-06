@@ -9,6 +9,7 @@ from lgatr.layers.slim_layers import (
     SlimMLP,
     SlimRMSNorm,
     SlimSelfAttention,
+    SlimVecLinear,
 )
 from lgatr.nets.slim import LGATrSlim
 from tests.helpers import BATCH_DIMS, TOLERANCES, check_equivariance
@@ -302,4 +303,17 @@ def test_LGATrSlim_equivariance(
 
     check_equivariance(
         layer, batch_dims=(*BATCH_DIMS, in_v_channels), fn_kwargs=dict(scalars=s), **TOLERANCES
+    )
+
+
+@pytest.mark.parametrize("in_v_channels,out_v_channels", [(4, 4), (7, 3)])
+def test_SlimVecLinear_equivariance(in_v_channels: int, out_v_channels: int) -> None:
+    # SlimVecLinear mixes vector channels and is SO(1, 3)-equivariant.
+    layer = SlimVecLinear(in_v_channels, out_v_channels)
+
+    v = torch.randn(*BATCH_DIMS[:-1], 4, in_v_channels)
+    assert layer(v).shape == (*BATCH_DIMS[:-1], 4, out_v_channels)
+
+    check_equivariance(
+        layer, batch_dims=(*BATCH_DIMS[:-1], in_v_channels), vector_dim=-2, **TOLERANCES
     )

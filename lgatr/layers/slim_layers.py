@@ -288,6 +288,42 @@ class SlimLinear(nn.Module):
                 nn.init.zeros_(self.linear_s.bias)
 
 
+class SlimVecLinear(nn.Module):
+    """Equivariant linear layer for vector features only.
+
+    Simplified version of SlimLinear restrained to vectors.
+
+    Parameters
+    ----------
+    in_v_channels
+        Number of input vector channels.
+    out_v_channels
+        Number of output vector channels.
+    """
+
+    def __init__(self, in_v_channels: int, out_v_channels: int) -> None:
+        super().__init__()
+        self.weight_v = nn.Parameter(torch.empty((out_v_channels, in_v_channels)))
+        bound = 1.0 / math.sqrt(max(in_v_channels, 1))
+        nn.init.uniform_(self.weight_v, a=-bound, b=bound)
+
+    @minimum_autocast_precision(torch.float32, output="high")
+    def forward(self, vectors: torch.Tensor) -> torch.Tensor:
+        """Mix vector channels.
+
+        Parameters
+        ----------
+        vectors
+            Lorentz vectors of shape ``(..., 4, in_v_channels)``.
+
+        Returns
+        -------
+        outputs_v
+            Lorentz vectors of shape ``(..., 4, out_v_channels)``.
+        """
+        return nn.functional.linear(vectors, self.weight_v)
+
+
 class SlimGLU(nn.Module):
     """Gated linear unit (GLU) for vector and scalar features.
 
