@@ -21,6 +21,7 @@ from .slim_layers import (
     SlimLinear,
     SlimMLP,
     SlimRMSNorm,
+    SlimScalarToVector,
     SlimSelfAttention,
     SlimVecLinear,
     SlimVectorToScalar,

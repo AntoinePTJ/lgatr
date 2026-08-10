@@ -325,7 +325,7 @@ class SlimVecLinear(nn.Module):
 
 
 class SlimVectorToScalar(nn.Module):
-    """Vector-to-scalar coupling: Minkowski invariants injected into the scalar stream.
+    """Vector-to-scalar coupling: Lorentz invariants injected into the scalar stream.
 
     The vector stream is projected to ``n_proj`` channels, the Gram matrix of Minkowski inner
     products of those channels is formed, and its upper triangle (``n_proj(n_proj+1)/2``
@@ -398,6 +398,58 @@ class SlimVectorToScalar(nn.Module):
         )
         invariants = gram[..., self.triu_row, self.triu_col]
         return self.linear_s(self.nonlinearity(invariants))
+
+
+class SlimScalarToVector(nn.Module):
+    """Scalar-to-vector coupling: an invariant per-channel gate on a vector channel mix.
+
+    The gate is a function of the scalars alone and multiplies a linear projection of the 
+    vector channels. An additional parameter scales the gate, to ensure zero-init regardless
+    of the activation function.
+
+    Parameters
+    ----------
+    v_channels
+        Number of vector channels (input and output).
+    s_channels
+        Number of scalar channels driving the gate.
+    nonlinearity
+        Nonlinearity applied to the gate.
+    zero_init
+        Whether to zero-initialize ``branch_scale``, to ensure it is inactive at the start.
+    """
+
+    def __init__(
+        self,
+        v_channels: int,
+        s_channels: int,
+        nonlinearity: str = "gelu",
+        zero_init: bool = True,
+    ) -> None:
+        super().__init__()
+        self.mix = SlimVecLinear(v_channels, v_channels)
+        self.gate = nn.Linear(s_channels, v_channels)
+        self.nonlinearity = get_nonlinearity(nonlinearity)
+        # Per-channel weight to allow for zero-init and not inject noise at the start
+        self.branch_scale = nn.Parameter(torch.full((v_channels,), 0.0 if zero_init else 1.0))
+
+    def forward(self, vectors: torch.Tensor, scalars: torch.Tensor) -> torch.Tensor:
+        """Gate the vector stream with the scalars.
+
+        Parameters
+        ----------
+        vectors
+            Lorentz vectors of shape ``(..., 4, v_channels)``.
+        scalars
+            Scalar features of shape ``(..., s_channels)``.
+
+        Returns
+        -------
+        outputs_v
+            Lorentz vectors of shape ``(..., 4, v_channels)``.
+        """
+        gate = self.branch_scale * self.nonlinearity(self.gate(scalars))
+        return gate[..., None, :] * self.mix(vectors)
 
 
 class SlimGLU(nn.Module):
@@ -716,6 +768,8 @@ class SlimBlock(nn.Module):
         Dropout probability.
     norm_elementwise_affine
         Whether the RMS norms learn a per-channel gain.
+    mix_s2v
+                Whether to gate the vector stream with the scalars using :class:`SlimScalarToVector`.
     mix_v2s
         Whether to inject invariants of the vector stream into the scalar stream with
         :class:`SlimVectorToScalar`. The invariants are added after the attention residual.
@@ -733,6 +787,7 @@ class SlimBlock(nn.Module):
         num_layers_mlp: int = 2,
         dropout_prob: float | None = None,
         norm_elementwise_affine: bool = True,
+        mix_s2v: bool = False,
         mix_v2s: bool = False,
     ) -> None:
         super().__init__()
@@ -740,6 +795,12 @@ class SlimBlock(nn.Module):
         self.norm1 = SlimRMSNorm(v_channels, s_channels, elementwise_affine=norm_elementwise_affine)
         self.norm2 = SlimRMSNorm(v_channels, s_channels, elementwise_affine=norm_elementwise_affine)
 
+        self.s2v = (
+            SlimScalarToVector(v_channels, s_channels, nonlinearity=nonlinearity)
+            if mix_s2v
+            else None
+        )
+        
         self.v2s = (
             SlimVectorToScalar(v_channels, s_channels, nonlinearity=nonlinearity)
             if mix_v2s
@@ -786,6 +847,9 @@ class SlimBlock(nn.Module):
             Scalar features of shape ``(..., items, s_channels)``.
         """
         h_v, h_s = self.norm1(vectors, scalars)
+
+        if self.s2v is not None:
+            h_v = h_v + self.s2v(h_v, h_s)
 
         h_v, h_s = self.attention(
             h_v,

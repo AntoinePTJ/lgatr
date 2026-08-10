@@ -8,6 +8,7 @@ from lgatr.layers.slim_layers import (
     SlimLinear,
     SlimMLP,
     SlimRMSNorm,
+    SlimScalarToVector,
     SlimSelfAttention,
     SlimVecLinear,
     SlimVectorToScalar,
@@ -43,10 +44,12 @@ GLU_CASES += [
 LINEAR_CASES = [(*channels, "default") for channels in CHANNELS] + [(*CHANNELS[0], "small")]
 
 
-# The vector<->scalar coupling options, as kwargs for LGATrSlim. Each entry is one ablation arm.
+# The vector<->scalar coupling options, as kwargs for LGATrSlim.
 COUPLINGS = {
     "none": {},
     "v2s": dict(mix_v2s=True),
+    "s2v": dict(mix_s2v=True),
+    "both": dict(mix_v2s=True, mix_s2v=True),
 }
 
 
@@ -409,7 +412,7 @@ def test_LGATrSlim_coupling_zero_init_is_a_noop(coupling: str) -> None:
     # the coupling modules draw from the RNG, so seeding is not enough to align the two networks
     missing, unexpected = coupled.load_state_dict(baseline.state_dict(), strict=False)
     assert not unexpected
-    assert missing and all(".v2s." in key for key in missing)
+    assert missing and all(".v2s." in key or ".s2v." in key for key in missing)
 
     v = torch.randn(*BATCH_DIMS, 1, 4)
     s = torch.randn(*BATCH_DIMS, 8)
@@ -437,3 +440,29 @@ def test_LGATrSlim_coupling_flags_reach_the_model(coupling: str) -> None:
         return {key: tuple(value.shape) for key, value in net.state_dict().items()}
 
     assert signature(coupled) != signature(baseline), f"{coupling} did not change the model"
+
+
+@pytest.mark.parametrize("v_channels,s_channels", [(4, 16), (2, 4)])
+def test_SlimScalarToVector_equivariance(v_channels: int, s_channels: int) -> None:
+    layer = SlimScalarToVector(v_channels, s_channels, zero_init=False)
+    s = torch.randn(*BATCH_DIMS[:-1], s_channels)
+
+    v = torch.randn(*BATCH_DIMS[:-1], 4, v_channels)
+    assert layer(v, scalars=s).shape == v.shape
+
+    check_equivariance(
+        layer,
+        batch_dims=(*BATCH_DIMS[:-1], v_channels),
+        fn_kwargs=dict(scalars=s),
+        vector_dim=-2,
+        **TOLERANCES,
+    )
+
+
+@pytest.mark.parametrize("nonlinearity", NONLINEARITIES)
+def test_SlimScalarToVector_zero_init(nonlinearity: str) -> None:
+    layer = SlimScalarToVector(4, 16, nonlinearity=nonlinearity)
+
+    v = torch.randn(*BATCH_DIMS[:-1], 4, 4)
+    s = torch.randn(*BATCH_DIMS[:-1], 16)
+    torch.testing.assert_close(layer(v, scalars=s), torch.zeros_like(v), **STRICT_TOLERANCES)
